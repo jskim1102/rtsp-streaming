@@ -36,7 +36,7 @@ setup 이 `.env.example` 을 복사해 `.env` 생성, 포트·비밀번호 자�
 | `BACKEND_PORT` | 자동 | 백엔드 API 포트. 브라우저가 이 포트로 직접 접속. |
 | `MEDIAMTX_WEBRTC_PORT` · `MEDIAMTX_ICE_UDP_PORT` · `MEDIAMTX_RTSP_PORT` · `MEDIAMTX_API_PORT` | 자동 | MediaMTX 포트 (아래 "포트 · 방화벽" 참고). |
 | `MEDIAMTX_BACKEND_PASS` · `MEDIAMTX_VIEWER_PASS` | 자동 (무작위) | MediaMTX 제어용 · 영상 시청용 비밀번호. |
-| `MEDIAMTX_WEBRTC_HOST` | setup 이 질문 | 이 PC의 LAN IP (예: `192.168.0.20`). **비우면 이 PC에서만 영상이 보이고 다른 기기에서는 검은 화면.** 찾는 법: `hostname -I` (Linux) · `ipconfig getifaddr en0` (macOS) · `ipconfig` (Windows). |
+| `MEDIAMTX_WEBRTC_HOST` | setup 이 질문 | 브라우저가 이 PC 에 닿는 주소 전부, 쉼표 구분 (예: `192.168.0.20,100.64.0.10,203.0.113.5` = LAN · VPN · 공인 IP). setup 질문에는 LAN IP 하나만 넣어도 되고, VPN · 외부망 접속이 필요하면 `.env` 에 직접 추가 (아래 "외부망 · VPN 접속" 참고). **비우면 이 PC에서만 영상 표시. 목록에 없는 주소로 접속하면 화면은 열려도 영상은 검은 화면.** LAN IP 찾는 법: `hostname -I` (Linux) · `ipconfig getifaddr en0` (macOS) · `ipconfig` (Windows). |
 | `MAX_IPCAMS` | 선택 (직접 추가) | 등록 가능 카메라 수 (기본 16). |
 | `CORS_ORIGINS` | 선택 (직접 추가) | 허용할 접속 origin, 여러 개는 쉼표 구분 (예: `http://192.168.0.20:<FRONTEND_PORT>`). 비우면 전체 허용. 공개 배포 시 프론트 주소로 한정 권장. |
 
@@ -70,6 +70,20 @@ sudo ufw allow <MEDIAMTX_ICE_UDP_PORT>/tcp   # MediaMTX ICE (UDP 막힌 망용 �
 ```
 
 > ICE udp 포트를 빠뜨리면 카메라 화면이 "연결됨"까지 갔다가 영상만 표시되지 않는, 원인 찾기 어려운 증상 발생. 반드시 개방.
+
+## 외부망 · VPN 접속
+
+같은 LAN 밖(회사 밖, 휴대폰 데이터, VPN)에서 접속하는 경우. 포트 개방만으로는 부족 — 영상 주소 목록(`MEDIAMTX_WEBRTC_HOST`)에 그 경로의 IP 추가 필요.
+
+1. **공인 IP 로 접속 (공유기 포트포워딩)**
+   - 공유기에서 위 "필요" 4개 포워딩: `FRONTEND_PORT` · `BACKEND_PORT` · `MEDIAMTX_WEBRTC_PORT` (tcp), `MEDIAMTX_ICE_UDP_PORT` (udp + tcp).
+   - **ICE 포트는 바깥 번호와 안쪽 번호를 같게** (예: 공인 `18003` → 이 PC `18003`). MediaMTX 가 안쪽 번호를 그대로 알려 주므로 번호가 다르면 영상 연결 실패.
+   - 공인 IP 를 `MEDIAMTX_WEBRTC_HOST` 에 추가.
+2. **VPN 으로 접속 (tailscale 등)**
+   - 이 PC 의 VPN IP (예: tailscale `tailscale ip -4`) 를 `MEDIAMTX_WEBRTC_HOST` 에 추가. 포트포워딩 불필요.
+3. `.env` 를 바꾼 뒤 setup 다시 실행.
+
+예: LAN + tailscale + 공인 IP 모두 쓰는 경우 — `MEDIAMTX_WEBRTC_HOST=192.168.0.20,100.64.0.10,203.0.113.5`
 
 ---
 
