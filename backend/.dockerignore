@@ -5,3 +5,7 @@ __pycache__
 .pytest_cache
 deepeye.db
 .env
+
+# 서명키 · 인증서는 이미지에 넣지 않는다 (실행할 때 넣는다)
+*.pem
+keys/
