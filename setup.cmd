@@ -1,4 +1,6 @@
 @echo off
-rem Windows: double-click this file. It runs setup.ps1 (harness template - do not edit here).
+rem Double-click to install or update rtsp-streaming on Windows.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup.ps1"
+set "setupResult=%errorlevel%"
 pause
+exit /b %setupResult%

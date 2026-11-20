@@ -8,6 +8,9 @@ backend/.env
 # 내부 빌드 입력/기록 (공개 불필요) — specs 전체(USAGE.md 포함) + plan.md
 plan.md
 specs/
+DESIGN.md
+.source/
+.sources/
 
 # python
 .venv/

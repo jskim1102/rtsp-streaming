@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# 설치 스크립트 (리눅스·맥) — git clone 한 폴더에서 `./setup.sh` 한 번이면 설치·실행까지 끝.
+# rtsp-streaming 설치 (리눅스·맥) — git clone 한 폴더에서 `./setup.sh` 한 번이면 설치·실행까지 끝.
 # 다시 실행해도 안전하다: 이미 채운 .env 값은 그대로 두고, 새 버전 이미지를 받아 다시 켠다.
-#
-# 하네스 정본: harness-claude/engine/templates/setup/setup.sh — 이 파일을 빌드에서 고치지 말 것.
-# 배포 검사(./run.sh release)가 정본과 같은지 비교한다. 규칙 = harness-claude/docs/release.md
+# 윈도우 PC 에서는 setup.cmd 를 더블클릭한다 (같은 순서로 같은 일을 한다).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -35,7 +33,6 @@ env_set() {  # KEY VALUE — 있으면 바꾸고, 없으면 덧붙인다
     printf '%s=%s\n' "$1" "$2" >> .env
   fi
 }
-env_del() { (umask 077; awk -v k="$1" 'index($0, k "=") != 1' .env > .env.tmp); mv .env.tmp .env; }
 rand() { od -An -N12 -tx1 /dev/urandom | tr -d ' \n'; }
 port_busy() {
   if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then return 0; fi
@@ -95,8 +92,13 @@ done
 if [ -n "$asks" ]; then
   tty=0; if [ -t 0 ] && [ -r /dev/tty ]; then tty=1; fi
   # 참고용 이 PC 주소 — docker·가상 브리지(br-·docker0·veth·virbr·bridge)는 빼고
-  ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth|virbr|bridge)/ {split($4, a, "/"); printf "%s(%s) ", a[1], $2}')
-  [ -n "$ips" ] || ips=$(ifconfig 2>/dev/null | awk '/^[a-z]/{n=$1; sub(/:$/, "", n)} /inet / && $2 != "127.0.0.1" && n !~ /^(docker|br-|veth|virbr|bridge)/ {printf "%s(%s) ", $2, n}')
+  ips=""
+  if command -v ip >/dev/null 2>&1; then
+    ips=$(ip -4 -o addr show scope global 2>/dev/null | awk '$2 !~ /^(docker|br-|veth|virbr|bridge)/ {split($4, a, "/"); printf "%s(%s) ", a[1], $2}') || ips=""
+  fi
+  if [ -z "$ips" ] && command -v ifconfig >/dev/null 2>&1; then
+    ips=$(ifconfig 2>/dev/null | awk '/^[a-z]/{n=$1; sub(/:$/, "", n)} /inet / && $2 != "127.0.0.1" && n !~ /^(docker|br-|veth|virbr|bridge)/ {printf "%s(%s) ", $2, n}') || ips=""
+  fi
   while IFS='|' read -r key q; do
     [ -n "$key" ] || continue
     if [ -n "$(env_get "$key")" ]; then continue; fi
@@ -118,81 +120,24 @@ fi
 
 chmod 600 .env  # 비밀번호가 들어 있다 — 나만 읽게 (전부터 있던 .env 도)
 
-# ── 3. GPU ──
-step "GPU 확인"
-gpu=0
-if [ -f docker-compose.gpu.yml ]; then
-  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-    if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep nvidia >/dev/null; then
-      gpu=1; ok "NVIDIA GPU 사용"
-    else
-      warn "NVIDIA GPU 는 있지만 Docker 가 GPU 를 못 써요 → CPU 로 실행해요."
-      warn "GPU 를 쓰려면 NVIDIA Container Toolkit 설치 후 다시 실행: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html"
-    fi
-  else
-    ok "GPU 없음 → CPU 로 실행 (느릴 수 있어요)"
-  fi
-else
-  ok "이 프로그램은 GPU 를 쓰지 않아요"
-fi
-if [ $gpu = 1 ]; then
-  env_set COMPOSE_PATH_SEPARATOR ":"
-  env_set COMPOSE_FILE "docker-compose.yml:docker-compose.gpu.yml"
-else
-  env_del COMPOSE_FILE; env_del COMPOSE_PATH_SEPARATOR
-fi
-
-# ── 4. 모델 파일 ──
-if [ -f weights.txt ]; then
-  step "모델 파일 받기"
-  command -v curl >/dev/null 2>&1 || die "curl 이 없어요. 설치한 뒤 다시 실행하세요."
-  while read -r path url _ || [ -n "${path:-}" ]; do
-    case "$path" in ''|'#'*) continue ;; esac
-    if [ -s "$path" ]; then ok "$path (이미 있음)"; continue; fi
-    mkdir -p "$(dirname "$path")"
-    curl -fL --retry 3 -o "$path.part" "$url" || die "$path 를 받지 못했어요: $url"
-    mv "$path.part" "$path"; ok "$path"
-  done < weights.txt
-fi
-
-# ── 5. 받기·만들기·켜기 ──
 step "설정 검사"
-if ! out=$(docker compose config -q 2>&1); then
-  die "설정이 덜 됐어요 — .env 를 열어 아래 항목을 채운 뒤 다시 실행하세요:
-$out"
-fi
-ok "설정 정상"
+docker compose config -q || die ".env 파일의 설정을 확인한 뒤 다시 실행하세요."
 
-step "프로그램 받기 (처음엔 몇 분 걸려요)"
-pull=""; build=""
-svcs=$(docker compose config | awk '/^services:/{s=1;next} /^[^ ]/{s=0}
-  s&&/^  [^ ]/{v=$1;sub(/:$/,"",v);o[++n]=v} s&&/^    build:/{b[v]=1} s&&/^    image:/{i[v]=$2}
-  END{for(k=1;k<=n;k++){v=o[k]; print v, (i[v]?i[v]:"-"), (b[v]?1:0)}}')
-while read -r svc img b; do
-  [ -n "$svc" ] || continue
-  case "$img" in
-    ghcr.io/*) pull="$pull $svc" ;;
-    *) if [ "$b" = 1 ]; then build="$build $svc"; fi ;;
-  esac
-done <<EOF
-$svcs
-EOF
-for svc in $pull; do
-  if docker compose pull "$svc"; then ok "$svc 받음"
-  else warn "$svc 이미지를 못 받았어요 → 이 PC 에서 직접 만들어요 (오래 걸려요)"; build="$build $svc"; fi
-done
-if [ -n "$build" ]; then
-  step "이 PC 에서 만들기:$build"
-  # shellcheck disable=SC2086
-  docker compose build $build || die "만들기에 실패했어요. 위 오류를 개발자에게 보내 주세요."
+step "MediaMTX와 서버 준비"
+# --policy 는 Compose 2.22 부터 — 그 전 버전은 이 옵션을 몰라 실패하므로 그때는 그냥 받는다
+docker compose pull --policy missing mediamtx || docker compose pull mediamtx || die "MediaMTX 이미지를 받지 못했어요. 인터넷 연결을 확인하세요."
+if ! docker compose pull backend; then
+  warn "서버 이미지를 받을 수 없어 이 PC에서 만듭니다. 처음에는 시간이 걸릴 수 있어요."
+  docker compose build backend || die "서버 이미지를 만들지 못했어요."
 fi
 
-step "켜기 (다 켜질 때까지 기다려요)"
-if ! docker compose up -d --wait --wait-timeout 900; then
+step "시청 화면 만들기"
+docker compose build frontend || die "시청 화면을 만들지 못했어요."
+
+step "서비스 시작"
+if ! docker compose up -d --no-build --pull never --wait --wait-timeout 900; then
   docker compose ps
-  die "켜지지 않았어요. 'docker compose logs' 출력을 개발자에게 보내 주세요."
+  die "서비스 시작에 실패했어요. docker compose logs 로 원인을 확인하세요."
 fi
 
-port=$(env_get FRONTEND_PORT); [ -n "$port" ] || port=$(env_get BACKEND_PORT)
-printf '\n✅ 설치 끝 — 브라우저에서 http://localhost:%s\n' "$port"
-echo "   끄기: docker compose down   다시 켜기: docker compose up -d   업데이트: git pull 후 ./setup.sh"
+printf '\n설치 완료 — 브라우저에서 http://localhost:%s 에 접속하세요.\n' "$(env_get FRONTEND_PORT)"

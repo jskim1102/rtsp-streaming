@@ -1,10 +1,10 @@
-# rtsp-streaming v2 — standalone 3컨테이너(backend + frontend + mediamtx)
+# rtsp-streaming — standalone 3컨테이너(backend + frontend + mediamtx)
 #
-# 실행:   docker compose up --build
+# 설치·실행: Linux·macOS는 ./setup.sh, Windows는 setup.cmd
 # 종료:   docker compose down
 #
 # 환경변수: 같은 디렉토리의 `.env` 를 compose 가 자동으로 읽어 ${VAR} 로 치환.
-#          (없으면 오류. `.env.example` 복사해서 만들어야 함.)
+#          setup이 .env.example로 .env를 생성한다.
 # 브라우저 접속: http://<서버IP>:${FRONTEND_PORT}  (frontend)
 
 services:
@@ -12,7 +12,6 @@ services:
   backend:
     build:
       context: ./backend
-    # 공개 이미지 — .env 값을 굽지 않으므로 ghcr.io 에 미리 올려 클라이언트가 받는다 (docs/release.md §8).
     image: ghcr.io/jskim1102/rtsp-streaming-backend:latest
     container_name: rtsp-streaming-backend
     environment:
@@ -30,6 +29,12 @@ services:
       MEDIAMTX_BACKEND_PASS: ${MEDIAMTX_BACKEND_PASS:?set MEDIAMTX_BACKEND_PASS in .env}
     ports:
       - "${BACKEND_PORT:?set BACKEND_PORT in .env}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
     volumes:
       # SQLite DB 영속화 — named volume (원본 bind-mount `touch deepeye.db` 트랩 회피).
       - ipcam_db:/app/data
@@ -37,13 +42,6 @@ services:
       - rtsp-streaming
     depends_on:
       - mediamtx
-    # setup 의 `docker compose up --wait` 가 기동 완료를 판정. slim 이미지엔 curl 이 없어 python 으로 호출.
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 20s
     restart: unless-stopped
 
   # ─────────────────────────────── Frontend ──────────────────────────────
@@ -60,13 +58,14 @@ services:
         VITE_MEDIAMTX_VIEWER_USER: "${MEDIAMTX_VIEWER_USER:-viewer_rtsp_streaming}"
         VITE_MEDIAMTX_VIEWER_PASS: "${MEDIAMTX_VIEWER_PASS:?set MEDIAMTX_VIEWER_PASS in .env}"
     image: rtsp-streaming-frontend:dev
+    pull_policy: build
     container_name: rtsp-streaming-frontend
     ports:
       # 호스트 ${FRONTEND_PORT} → 컨테이너 80 (Nginx 기본 포트, 이미지 빌드시 고정)
       - "${FRONTEND_PORT:?set FRONTEND_PORT in .env}:80"
     depends_on:
-      - backend
-    # nginx 응답 확인 — alpine 의 busybox wget 사용.
+      backend:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
       interval: 10s
@@ -80,8 +79,8 @@ services:
     image: bluenviron/mediamtx:1.19.1-ffmpeg
     container_name: rtsp-streaming-mediamtx
     environment:
-      # 외부 WHEP 연결에 광고할 LAN/공인 IP. 비우면 Docker host 밖 ICE 연결이 실패할 수 있다.
-      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_WEBRTC_HOST:-}
+      # 시청 브라우저가 접속할 주소. 비워 두면 같은 PC의 게시된 ICE 포트를 사용한다.
+      MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_WEBRTC_HOST:-127.0.0.1}
       MTX_WEBRTCLOCALUDPADDRESS: ":${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}"
       # UDP 가 막힌 외부망(회사/카페 방화벽, 라우터 UDP 포워딩 불가)용 ICE TCP fallback — 같은 포트의 tcp.
       MTX_WEBRTCLOCALTCPADDRESS: ":${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}"

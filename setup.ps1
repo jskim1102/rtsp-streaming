@@ -1,9 +1,6 @@
-﻿# 설치 스크립트 (윈도우) — git clone 한 폴더에서 setup.cmd 를 더블클릭하면 설치·실행까지 끝.
+﻿# rtsp-streaming 설치 (윈도우) — git clone 한 폴더에서 setup.cmd 를 더블클릭하면 설치·실행까지 끝.
 # 다시 실행해도 안전하다: 이미 채운 .env 값은 그대로 두고, 새 버전 이미지를 받아 다시 켠다.
-#
-# 하네스 정본: harness-claude/engine/templates/setup/setup.ps1 — 이 파일을 빌드에서 고치지 말 것.
-# 배포 검사(./run.sh release)가 정본과 같은지 비교한다. 규칙 = harness-claude/docs/release.md
-# 이 파일은 UTF-8 (BOM 있음) 이어야 한다 — Windows PowerShell 5.1 이 한글을 깨뜨리지 않게.
+# 리눅스·맥에서는 ./setup.sh 를 실행한다 (같은 순서로 같은 일을 한다).
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 $Root = $PSScriptRoot
@@ -34,8 +31,10 @@ function EnvSet($k, $v) {
   for ($i = 0; $i -lt $script:Lines.Count; $i++) { if ($script:Lines[$i].StartsWith("$k=")) { $script:Lines[$i] = "$k=$v"; return } }
   [void]$script:Lines.Add("$k=$v")
 }
-function EnvDel($k) { $script:Lines = [Collections.ArrayList]@($script:Lines | Where-Object { -not $_.StartsWith("$k=") }) }
-function EnvSave { [IO.File]::WriteAllText($EnvPath, (($script:Lines -join "`n") + "`n"), $Utf8) }  # LF — compose 가 읽는 형식
+function EnvSave {
+  $ErrorActionPreference = 'Stop'
+  [IO.File]::WriteAllText($EnvPath, (($script:Lines -join "`n") + "`n"), $Utf8)
+}
 function Rand { $b = New-Object byte[] 12; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') }) }
 # Hyper-V·WSL 이 막아 둔 포트 구간 — 비어 보여도 Docker 가 못 쓴다
 $Excluded = @()
@@ -104,75 +103,34 @@ if ($asks.Count -gt 0) {
   }
 }
 
-# ── 3. GPU ──
-Step 'GPU 확인'
-$gpu = $false
-if (Test-Path -LiteralPath (Join-Path $Root 'docker-compose.gpu.yml')) {
-  if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
-    $null = & nvidia-smi -L 2>&1
-    if ($LASTEXITCODE -eq 0) { $gpu = $true; Ok 'NVIDIA GPU 사용' }
-  }
-  if (-not $gpu) { Ok 'GPU 없음 -> CPU 로 실행 (느릴 수 있어요)' }
-} else {
-  Ok '이 프로그램은 GPU 를 쓰지 않아요'
-}
-if ($gpu) {
-  EnvSet 'COMPOSE_PATH_SEPARATOR' ':'
-  EnvSet 'COMPOSE_FILE' 'docker-compose.yml:docker-compose.gpu.yml'
-} else {
-  EnvDel 'COMPOSE_FILE'; EnvDel 'COMPOSE_PATH_SEPARATOR'
-}
 EnvSave
-
-# ── 4. 모델 파일 ──
-$Weights = Join-Path $Root 'weights.txt'
-if (Test-Path -LiteralPath $Weights) {
-  Step '모델 파일 받기'
-  if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) { Die 'curl.exe 가 없어요. 윈도우를 업데이트한 뒤 다시 실행하세요.' }
-  foreach ($line in [IO.File]::ReadAllLines($Weights)) {
-    $f = $line.Trim() -split '\s+'
-    if (-not $f[0] -or $f[0].StartsWith('#')) { continue }
-    $path = Join-Path $Root $f[0]
-    if ((Test-Path -LiteralPath $path) -and (Get-Item -LiteralPath $path).Length -gt 0) { Ok "$($f[0]) (이미 있음)"; continue }
-    $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path)
-    & curl.exe -fL --retry 3 -o "$path.part" $f[1]
-    if ($LASTEXITCODE -ne 0) { Die "$($f[0]) 를 받지 못했어요: $($f[1])" }
-    Move-Item -Force -LiteralPath "$path.part" -Destination $path; Ok $f[0]
-  }
-}
-
-# ── 5. 받기·만들기·켜기 ──
 Step '설정 검사'
-$out = & docker compose config -q 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) { Die ".env 설정이 덜 됐어요 - .env 를 메모장으로 열어 아래 항목을 채운 뒤 다시 실행하세요:`n$out" }
-Ok '설정 정상'
+& docker compose config -q
+if ($LASTEXITCODE -ne 0) { Die '.env 파일의 설정을 확인한 뒤 다시 실행하세요.' }
 
-Step '프로그램 받기 (처음엔 몇 분 걸려요)'
-$cfg = (& docker compose config --format json 2>$null) -join "`n" | ConvertFrom-Json
-$pull = @(); $build = @()
-foreach ($s in $cfg.services.PSObject.Properties) {
-  if ("$($s.Value.image)".StartsWith('ghcr.io/')) { $pull += $s.Name }
-  elseif ($s.Value.build) { $build += $s.Name }
-}
-foreach ($svc in $pull) {
-  & docker compose pull $svc
-  if ($LASTEXITCODE -eq 0) { Ok "$svc 받음" }
-  else { Warn "$svc 이미지를 못 받았어요 -> 이 PC 에서 직접 만들어요 (오래 걸려요)"; $build += $svc }
-}
-if ($build.Count -gt 0) {
-  Step "이 PC 에서 만들기: $($build -join ' ')"
-  & docker compose build @build
-  if ($LASTEXITCODE -ne 0) { Die '만들기에 실패했어요. 위 오류를 개발자에게 보내 주세요.' }
+Step 'MediaMTX와 서버 준비'
+& docker compose pull --policy missing mediamtx
+# --policy 는 Compose 2.22 부터 — 그 전 버전은 이 옵션을 몰라 실패하므로 그때는 그냥 받는다
+if ($LASTEXITCODE -ne 0) { & docker compose pull mediamtx }
+if ($LASTEXITCODE -ne 0) { Die 'MediaMTX 이미지를 받지 못했어요. 인터넷 연결을 확인하세요.' }
+& docker compose pull backend
+if ($LASTEXITCODE -ne 0) {
+  Warn '서버 이미지를 받을 수 없어 이 PC에서 만듭니다. 처음에는 시간이 걸릴 수 있어요.'
+  & docker compose build backend
+  if ($LASTEXITCODE -ne 0) { Die '서버 이미지를 만들지 못했어요.' }
 }
 
-Step '켜기 (다 켜질 때까지 기다려요)'
-& docker compose up -d --wait --wait-timeout 900
+Step '시청 화면 만들기'
+& docker compose build frontend
+if ($LASTEXITCODE -ne 0) { Die '시청 화면을 만들지 못했어요.' }
+
+Step '서비스 시작'
+& docker compose up -d --no-build --pull never --wait --wait-timeout 900
 if ($LASTEXITCODE -ne 0) {
   & docker compose ps
-  Die "켜지지 않았어요. 'docker compose logs' 출력을 개발자에게 보내 주세요."
+  Die '서비스 시작에 실패했어요. docker compose logs 로 원인을 확인하세요.'
 }
 
-$port = EnvGet 'FRONTEND_PORT'; if (-not $port) { $port = EnvGet 'BACKEND_PORT' }
+$port = EnvGet 'FRONTEND_PORT'
 Write-Host ''
-Write-Host "설치 끝 - 브라우저에서 http://localhost:$port" -ForegroundColor Green
-Write-Host '   끄기: docker compose down   다시 켜기: docker compose up -d   업데이트: git pull 후 setup.cmd'
+Write-Host "설치 완료 — 브라우저에서 http://localhost:$port 에 접속하세요." -ForegroundColor Green
