@@ -97,6 +97,9 @@ if ($asks.Count -gt 0) {
     Write-Host ''; Write-Host "  ? $($asks[$k])"
     if (($k.EndsWith('_HOST') -or $k.EndsWith('_IP')) -and $ips) { Write-Host "    참고 - 이 PC 의 IP: $ips" }
     $ans = "$(Read-Host '  ')".Trim()
+    if ($k -eq 'MEDIAMTX_WEBRTC_HOST') {
+      $ans = $ans -replace '\s*,\s*', ','
+    }
     if ($ans) { EnvSet $k $ans; Ok "$k=$ans" } else { Ok "$k 비워 둠" }
   }
 }

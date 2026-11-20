@@ -107,6 +107,9 @@ if [ -n "$asks" ]; then
     printf '  > '
     ans=""; read -r ans </dev/tty || ans=""
     ans=$(printf '%s' "$ans" | sed 's/^ *//; s/ *$//')
+    if [ "$key" = MEDIAMTX_WEBRTC_HOST ]; then
+      ans=$(printf '%s' "$ans" | sed 's/[[:blank:]]*,[[:blank:]]*/,/g')
+    fi
     if [ -n "$ans" ]; then env_set "$key" "$ans"; ok "$key=$ans"; else ok "$key 비워 둠"; fi
   done <<EOF
 $asks
