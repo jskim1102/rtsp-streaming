@@ -45,11 +45,10 @@ cd rtsp-streaming
 | `CORS_ORIGINS` | 선택&nbsp;(직접&nbsp;추가) | 허용할 접속 origin (쉼표 구분) |
 
 * MediaMTX 포트 4개는 아래 "포트 · 방화벽" 참고.
-* 자동 포트는 18000번부터 이 PC 에서 비어 있는 번호.
 * 나머지 값(`MEDIAMTX_API`, `MEDIAMTX_PATH_PREFIX`, 사용자명)은 기본값 그대로 유지.
 * `MEDIAMTX_WEBRTC_HOST`
   * 예: `192.168.0.20,100.64.0.10,203.0.113.5` (LAN · VPN · 공인 IP).
-  * setup 질문에는 LAN IP 하나만 넣어도 되고, VPN · 외부망 접속이 필요하면 `.env` 에 직접 추가 (아래 "외부망 · VPN 접속" 참고).
+  * setup 질문에 여러 주소를 쉼표로 넣거나, 나중에 `.env` 에 직접 추가 (아래 "외부망 · VPN 접속" 참고).
   * **비우면 이 PC에서만 영상 표시.**
   * **목록에 없는 주소로 접속하면 화면은 열려도 영상은 검은 화면.**
   * LAN IP 찾는 법: `hostname -I` (Linux) · `ipconfig getifaddr en0` (macOS) · `ipconfig` (Windows).
