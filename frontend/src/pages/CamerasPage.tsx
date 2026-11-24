@@ -133,7 +133,8 @@ export default function CamerasPage() {
     if (!window.confirm(`${cam.name} 삭제?`)) return;
     const resp = await fetch(`${apiBase()}/api/ipcams/${cam.id}`, { method: "DELETE" });
     if (!resp.ok) {
-      setError("카메라 삭제에 실패했습니다.");
+      // 백엔드 detail(예: 다른 작업 진행 중 409)을 그대로 노출 — PUT 경로와 일관.
+      setError(await errorDetail(resp, "카메라 삭제에 실패했습니다."));
       return;
     }
     await fetchCams();

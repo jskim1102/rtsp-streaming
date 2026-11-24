@@ -7,6 +7,7 @@ mediamtx 컨테이너가 한다. v1 에서 떼냈던 경로를 v2 에서 복원�
 import logging
 import subprocess
 import threading
+import weakref
 from collections.abc import Callable
 
 import httpx
@@ -23,6 +24,29 @@ logger = logging.getLogger("rtsp-streaming.mediamtx")
 # 동기화 주기 — 영상 플레이어 재접속 시도(약 30초) 안에 path 가 복구되도록 짧게 둔다.
 # 한 주기의 기본 부하는 mediamtx 목록 조회 1회다.
 SYNC_INTERVAL_SEC = 5.0
+
+# 카메라별 작업 잠금 — stream_key 마다 하나. 등록·수정·삭제 API 와 동기화가 같은 카메라를 동시에 건드리지 않게 한다.
+# DB 쓰기 락과 별개다 — 다른 카메라 작업과 DB 는 막지 않는다.
+# 백엔드가 프로세스 1개라는 가정이다 (여러 개면 프로세스마다 따로라 효과가 없다).
+# 약한 참조로 둔다 — 아무도 잡고 있지 않은 잠금은 저절로 사라진다.
+# 그렇지 않으면 실패한 등록 요청(새 stream_key)마다 항목이 하나씩 영구히 쌓인다.
+_camera_locks: "weakref.WeakValueDictionary[str, threading.Lock]" = weakref.WeakValueDictionary()
+_camera_locks_guard = threading.Lock()
+
+
+def camera_lock(stream_key: str) -> threading.Lock:
+    """그 카메라의 작업 잠금 — 같은 stream_key 면 늘 같은 잠금을 돌려준다.
+
+    - 부르는 쪽은 `acquire(blocking=False)` 로 기다리지 않고 시도한다.
+    - API 는 잡혀 있으면 409, 동기화는 그 카메라를 이번 주기만 건너뛴다.
+    """
+    with _camera_locks_guard:
+        lock = _camera_locks.get(stream_key)
+        if lock is None:
+            # 누군가 잡고 있는 동안에는 그 참조가 살아 있어 같은 잠금을 돌려준다.
+            lock = threading.Lock()
+            _camera_locks[stream_key] = lock
+        return lock
 
 
 def _validate_rtsp_url(rtsp_url: str) -> None:
@@ -250,6 +274,7 @@ class StreamReconciler:
     - 상태 확인: mediamtx 상태 목록으로 상태 저장소(hub)를 바로잡는다. 훅이 빠지거나 순서가 뒤바뀐 경우의 보정이다.
     - 빠진 path(DB 에만 있음): 재등록한다. mediamtx 가 재시작되면 동적 등록한 path 가 사라진다.
     - 남은 path(mediamtx 에만 있음): 이 모듈 형식만, 두 주기 연속 보이면 지운다.
+    - API 가 작업 중인 카메라(카메라 잠금이 잡힘)는 재등록하지 않고 다음 주기로 미룬다.
     - mediamtx 조회 실패: 그 주기를 건너뛴다. 실패를 '경로 없음'으로 보면 재등록이 폭주한다.
     - 주기 사이에 남은 path 후보와 직전 연결 상태를 기억하므로 인스턴스 하나를 계속 쓴다.
     """
@@ -267,9 +292,9 @@ class StreamReconciler:
         if statuses is not None:
             self._hub.replace_all(statuses)
 
-        # DB 를 먼저 읽는다 — 등록 API 는 mediamtx 등록 뒤에 DB 를 커밋한다.
-        # 커밋 전 카메라는 여기 안 보이므로, 등록 중인 path 를 빠졌다고 보고 중복 등록하지 않는다.
-        cams = dict(db.query(IpCam.stream_key, IpCam.rtsp_url).all())
+        # DB 를 먼저 읽는다 — 목록을 먼저 읽으면 쓸데없는 재등록(400)이 생긴다.
+        # 목록과 DB 읽기 사이에 등록 API 가 등록까지 마친 카메라가 '빠진 path' 로 보이기 때문이다.
+        cams = {stream_key for (stream_key,) in db.query(IpCam.stream_key).all()}
 
         # 조회 실패는 '경로 없음'이 아니다 — 등록·삭제 없이 끝낸다.
         # 로그는 연결 상태가 바뀌는 순간에만 남긴다 (끊김 1줄, 다시 연결됨 1줄).
@@ -288,13 +313,13 @@ class StreamReconciler:
 
         # 빠진 path 를 한 대씩 재등록한다 — 동시 등록은 하지 않는다.
         # 한 대에 ffprobe(최대 4초) + 등록 요청(최대 5초)이 걸려, 대량 재등록이면 주기가 길어진다.
-        for stream_key in sorted(cams.keys() - paths):
-            self._register_missing(db, stream_key, cams[stream_key])
+        for stream_key in sorted(cams - paths):
+            self._register_missing(db, stream_key)
 
         # 남은 path 는 이 모듈 형식만 대상이다 — all_others·다른 프로젝트 path 는 건드리지 않는다.
-        # 처음 보면 후보로만 둔다 — 등록 API 가 path 를 만든 뒤 커밋하기 직전일 수 있다.
+        # 처음 보면 후보로만 둔다 — 위에서 DB 를 읽은 뒤 등록 API 가 커밋·등록을 마친 카메라일 수 있다.
         # 다음 주기에도 보이면 지운다. 제거에 실패하면 후보로 남아 다음 주기에 다시 시도한다.
-        orphans = {p for p in paths - cams.keys() if p.startswith(stream_key_prefix())}
+        orphans = {p for p in paths - cams if p.startswith(stream_key_prefix())}
         for stream_key in sorted(orphans & self._orphan_candidates):
             if remove_stream(stream_key):
                 logger.info("DB 에 없는 mediamtx path 제거: %s", stream_key)
@@ -302,17 +327,24 @@ class StreamReconciler:
         self._orphan_candidates = orphans
 
     @staticmethod
-    def _register_missing(db: Session, stream_key: str, rtsp_url: str) -> None:
+    def _register_missing(db: Session, stream_key: str) -> None:
         """빠진 path 하나를 재등록한다 — 실패하면 다음 주기에 다시 시도된다."""
-        # ffprobe 가 실패해도(카메라 꺼짐 등) 재인코딩 명령으로 등록은 성공한다.
-        logger.info("mediamtx path 누락 → 재등록: %s", stream_key)
-        if not register_stream(stream_key, rtsp_url):
+        # API 가 그 카메라를 작업 중이면 기다리지 않고 이번 주기만 건너뛴다.
+        # 등록 API 는 커밋 뒤 등록을 마칠 때까지 잠금을 잡으므로, 같은 path 를 먼저 등록하지 않는다.
+        lock = camera_lock(stream_key)
+        if not lock.acquire(blocking=False):
             return
-        # 등록하는 사이 삭제 API 가 카메라를 지웠으면 되살아난 path 를 바로 지운다.
-        # 삭제 API 의 sweep 보다 늦게 등록이 끝난 경우를 막는다 — 남겨 두면 지운 카메라가 재생된다.
-        if db.query(IpCam.id).filter(IpCam.stream_key == stream_key).first() is None:
-            logger.info("재등록 중 삭제된 카메라 → path 제거: %s", stream_key)
-            remove_stream(stream_key)
+        try:
+            # 주기 처음에 읽은 DB 목록은 낡았을 수 있어 잠금 안에서 다시 읽는다.
+            # 그 사이 지워졌으면 등록하지 않고(지운 카메라를 되살리지 않음), 주소가 바뀌었으면 새 주소로 등록한다.
+            rtsp_url = db.query(IpCam.rtsp_url).filter(IpCam.stream_key == stream_key).scalar()
+            if rtsp_url is None:
+                return
+            # ffprobe 가 실패해도(카메라 꺼짐 등) 재인코딩 명령으로 등록은 성공한다.
+            logger.info("mediamtx path 누락 → 재등록: %s", stream_key)
+            register_stream(stream_key, rtsp_url)
+        finally:
+            lock.release()
 
 
 def run_sync_loop(

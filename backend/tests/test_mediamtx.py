@@ -378,21 +378,84 @@ def test_reconcile_never_removes_paths_outside_module_format(sessions, mtx_calls
     mtx_calls["remove"].assert_not_called()
 
 
-def test_reconcile_removes_path_when_camera_deleted_during_registration(sessions, mtx_calls):
-    """재등록 중 삭제 API 가 카메라를 지웠으면 되살아난 path 를 바로 지운다."""
+def _run_cycle_with_listing(sessions, listing) -> None:
+    """설정 목록 조회 대신 listing() 을 부르며 한 주기를 돌린다 — 조회 사이에 API 가 끼어드는 상황용."""
+    reconciler = mediamtx.StreamReconciler(StreamStatusHub())
+    with patch("app.mediamtx.list_config_paths", side_effect=listing), \
+         patch("app.mediamtx.list_path_status", return_value=None):
+        with sessions() as db:
+            reconciler.run_once(db)
+
+
+def test_reconcile_skips_camera_deleted_before_registration(sessions, mtx_calls):
+    """DB 를 읽은 뒤 삭제 API 가 카메라를 지웠으면 재등록하지 않는다 — 지운 카메라를 되살리지 않는다."""
     _add_cam(sessions, "ipcam-a")
 
-    def register_then_deleted_by_api(stream_key, rtsp_url):
+    def listing_after_api_delete():
         with sessions() as api_db:
-            api_db.query(IpCam).filter(IpCam.stream_key == stream_key).delete()
+            api_db.query(IpCam).filter(IpCam.stream_key == "ipcam-a").delete()
             api_db.commit()
-        return True
+        return set()
 
-    mtx_calls["register"].side_effect = register_then_deleted_by_api
+    _run_cycle_with_listing(sessions, listing_after_api_delete)
+
+    mtx_calls["register"].assert_not_called()
+
+
+def test_reconcile_registers_with_latest_db_url(sessions, mtx_calls):
+    _add_cam(sessions, "ipcam-a", "rtsp://cam/old")
+
+    def listing_after_api_update():
+        with sessions() as api_db:
+            api_db.query(IpCam).filter(IpCam.stream_key == "ipcam-a").update({"rtsp_url": "rtsp://cam/new"})
+            api_db.commit()
+        return set()
+
+    _run_cycle_with_listing(sessions, listing_after_api_update)
+
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/new")
+
+
+def test_reconcile_skips_camera_locked_by_api(sessions, mtx_calls):
+    """API 가 작업 중인 카메라는 기다리지 않고 그 주기만 건너뛴다."""
+    _add_cam(sessions, "ipcam-a")
+
+    with mediamtx.camera_lock("ipcam-a"):
+        _run_cycles(sessions, [set()])
+    mtx_calls["register"].assert_not_called()
+
+    _run_cycles(sessions, [set()])
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1")
+
+
+def test_reconcile_holds_camera_lock_while_registering(sessions, mtx_calls):
+    """재등록하는 동안 그 카메라는 잠겨 있다 — 그 사이 수정·삭제 API 는 409 를 받는다."""
+    _add_cam(sessions, "ipcam-a")
+    locked = []
+    mtx_calls["register"].side_effect = lambda stream_key, rtsp_url: locked.append(
+        mediamtx.camera_lock(stream_key).locked()) or True
 
     _run_cycles(sessions, [set()])
 
-    mtx_calls["remove"].assert_called_once_with("ipcam-a")
+    assert locked == [True]
+    assert not mediamtx.camera_lock("ipcam-a").locked()
+
+
+def test_camera_lock_is_one_per_stream_key():
+    assert mediamtx.camera_lock("ipcam-a") is mediamtx.camera_lock("ipcam-a")
+    assert mediamtx.camera_lock("ipcam-a") is not mediamtx.camera_lock("ipcam-b")
+
+
+def test_unused_camera_lock_does_not_accumulate():
+    """아무도 잡고 있지 않은 잠금은 사라진다 — 실패한 등록 요청(새 stream_key)마다 항목이 쌓이지 않게."""
+    import gc
+
+    lock = mediamtx.camera_lock("ipcam-gone")
+    assert "ipcam-gone" in mediamtx._camera_locks
+    del lock
+    gc.collect()
+
+    assert "ipcam-gone" not in mediamtx._camera_locks
 
 
 def test_sync_loop_survives_cycle_exception(caplog):

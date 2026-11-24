@@ -6,13 +6,18 @@ CRUD list/create/update/delete 는 추출 코드의 기존 동작을 고정(char
 
 import json
 import os
+import sqlite3
 import tempfile
-from unittest.mock import patch
+from contextlib import closing
+from unittest.mock import call, patch
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.mediamtx import camera_lock
 
 
 @pytest.fixture()
@@ -62,6 +67,7 @@ def client(mtx):
 
     app.dependency_overrides[get_db] = _override_get_db
     with TestClient(app) as c:
+        c.db_path = path  # 외부 통신 중 DB 락을 확인하는 테스트용
         yield c
     app.dependency_overrides.clear()
     engine.dispose()
@@ -174,10 +180,7 @@ def test_delete_removes_mediamtx_path(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "d", "rtsp_url": "rtsp://x/d"}).json()
     mtx["remove"].reset_mock()
     client.delete(f"/api/ipcams/{cam['id']}")
-    # 초기 제거 + commit 후 sweep = 2회, 둘 다 같은 stream_key (TOCTOU race close).
-    assert mtx["remove"].call_count == 2
-    for call in mtx["remove"].call_args_list:
-        assert call.args == (cam["stream_key"],)
+    mtx["remove"].assert_called_once_with(cam["stream_key"])
 
 
 # ─── net-new: codex #4 — mediamtx 제거 실패 시 orphan 라이브 스트림 차단 (security) ───
@@ -206,31 +209,89 @@ def test_delete_503_when_mediamtx_api_unset(client, mtx):
     assert len(client.get("/api/ipcams").json()) == 1
 
 
-def test_delete_sweeps_path_after_commit_to_close_resurrection_race(client, mtx):
-    """commit 직후 sweep remove_stream 1회 더 — 삭제~commit 사이 백그라운드 동기화가
-    path 를 재등록(resurrection)했어도 sweep 가 제거한다(1차 방어, TOCTOU).
+# ─── 외부 통신은 DB 쓰기 락 밖에서 + 카메라별 작업 잠금 ───
 
-    단일스레드 TestClient 라 실제 동시폴링은 못 내지만, sweep 호출(=race close 메커니즘)이
-    실제로 발생하는지 — 초기 제거 + sweep = remove_stream 2회 — 를 고정한다.
-    """
-    cam = client.post("/api/ipcams", json={"name": "d", "rtsp_url": "rtsp://x/d"}).json()
+
+def _assert_db_writable(db_path: str) -> None:
+    """다른 연결이 쓰기 락을 바로 얻어야 한다 — 외부 통신하는 동안 락을 잡고 있지 않다는 뜻이다."""
+    with closing(sqlite3.connect(db_path, timeout=0.1)) as con:
+        con.execute("BEGIN IMMEDIATE")  # 락이 잡혀 있으면 0.1초 뒤 'database is locked'
+        con.rollback()
+
+
+def test_create_commits_before_mediamtx_registration_without_db_lock(client, mtx):
+    committed = []
+
+    def register(stream_key, rtsp_url):
+        _assert_db_writable(client.db_path)
+        with closing(sqlite3.connect(client.db_path)) as con:
+            committed.append(con.execute(
+                "SELECT count(*) FROM ip_cams WHERE stream_key = ?", (stream_key,)).fetchone()[0])
+        return True
+
+    mtx["register"].side_effect = register
+    resp = client.post("/api/ipcams", json={"name": "c", "rtsp_url": "rtsp://x/c"})
+
+    assert resp.status_code == 201
+    assert committed == [1], "MediaMTX 등록 전에 카메라가 커밋되지 않았다"
+
+
+def test_create_holds_camera_lock_while_registering(client, mtx):
+    """등록하는 동안 그 카메라는 잠겨 있다 — 동기화가 같은 경로를 먼저 등록하지 않는다."""
+    locked = []
+    mtx["register"].side_effect = lambda stream_key, rtsp_url: locked.append(camera_lock(stream_key).locked()) or True
+
+    resp = client.post("/api/ipcams", json={"name": "c", "rtsp_url": "rtsp://x/c"})
+
+    assert resp.status_code == 201
+    assert locked == [True]
+    assert not camera_lock(resp.json()["stream_key"]).locked()
+
+
+def test_update_calls_mediamtx_without_db_lock(client, mtx):
+    cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
+    mtx["update"].side_effect = lambda stream_key, rtsp_url: _assert_db_writable(client.db_path) or True
+
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+
+    assert resp.status_code == 200
+    assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://x/new"
+
+
+def test_update_reverts_mediamtx_when_save_fails(client, mtx):
+    """MediaMTX 는 바꿨는데 DB 저장이 실패하면 MediaMTX 를 이전 주소로 되돌린다."""
+    cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
+    locked = OperationalError("COMMIT", {}, Exception("database is locked"))
+
+    with patch.object(Session, "commit", side_effect=locked):
+        resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+
+    assert resp.status_code == 503
+    assert mtx["update"].call_args_list == [
+        call(cam["stream_key"], "rtsp://x/new"),
+        call(cam["stream_key"], "rtsp://x/old"),
+    ]
+    assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://x/old"
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+def test_returns_409_while_same_camera_is_busy(client, mtx, method):
+    """같은 카메라에 다른 작업이 진행 중이면 기다리지 않고 409 — 앞사람의 수정을 덮어쓰지 않는다."""
+    cam = client.post("/api/ipcams", json={"name": "b", "rtsp_url": "rtsp://x/old"}).json()
+    mtx["update"].reset_mock()
     mtx["remove"].reset_mock()
-    resp = client.delete(f"/api/ipcams/{cam['id']}")
-    assert resp.status_code == 204
-    assert mtx["remove"].call_count == 2  # 초기 + sweep
-    assert client.get("/api/ipcams").json() == []  # row 삭제됨
 
+    with camera_lock(cam["stream_key"]):
+        if method == "put":
+            resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "new", "rtsp_url": "rtsp://x/new"})
+        else:
+            resp = client.delete(f"/api/ipcams/{cam['id']}")
 
-def test_delete_succeeds_when_sweep_fails(client, mtx):
-    """sweep(2번째 remove)이 실패해도 — commit 은 이미 끝났으므로 — 삭제는 204 로 성공한다
-    (best-effort; orphan 가능성은 warning 로그만). 초기 제거는 성공해야 commit 에 도달."""
-    cam = client.post("/api/ipcams", json={"name": "d", "rtsp_url": "rtsp://x/d"}).json()
-    # 초기 제거 성공(→commit), sweep 실패
-    mtx["remove"].side_effect = [True, False]
-    resp = client.delete(f"/api/ipcams/{cam['id']}")
-    assert resp.status_code == 204
-    assert mtx["remove"].call_count == 2
-    assert client.get("/api/ipcams").json() == []  # commit 됐으니 row 없음
+    assert resp.status_code == 409
+    assert "다른 작업" in resp.json()["detail"]
+    mtx["update"].assert_not_called()
+    mtx["remove"].assert_not_called()
+    assert client.get("/api/ipcams").json()[0]["name"] == "b"
 
 
 # ─── SSE 상태 푸시 (카메라별 stats 폴링 대체) ───
