@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { apiBase } from "../hooks/useApi";
 import CameraFormModal from "../components/CameraFormModal";
 import CameraGrid from "../components/CameraGrid";
 
@@ -9,6 +8,7 @@ export interface Cam {
   rtsp_url: string;
   stream_key: string;
   created_at: string;
+  version: number; // 낙관적 락 — 수정 요청에 실어 보낸다. 다른 사람이 먼저 저장했으면 409.
 }
 
 interface Stat {
@@ -41,10 +41,13 @@ export default function CamerasPage() {
   // 응답 rtsp_url 은 마스킹(:***@)이라 비번-only 변경을 서버 응답으론 못 잡으므로 이 신호를 쓴다.
   const [playerEpoch, setPlayerEpoch] = useState<Record<number, number>>({});
 
-  const fetchCams = useCallback(async () => {
-    const resp = await fetch(`${apiBase()}/api/ipcams`);
-    if (!resp.ok) return;
-    setCams(await resp.json());
+  // 목록을 다시 받아 화면에 반영하고, 받은 목록을 돌려준다(수정 충돌 때 최신 값을 찾는 데 쓴다).
+  const fetchCams = useCallback(async (): Promise<Cam[] | null> => {
+    const resp = await fetch(`/api/ipcams`);
+    if (!resp.ok) return null;
+    const list: Cam[] = await resp.json();
+    setCams(list);
+    return list;
   }, []);
 
   useEffect(() => {
@@ -53,7 +56,7 @@ export default function CamerasPage() {
 
   // 등록 cap 을 백엔드에서 1회 로딩 (없으면 fallback 유지).
   useEffect(() => {
-    fetch(`${apiBase()}/api/config`)
+    fetch(`/api/config`)
       .then((r) => (r.ok ? r.json() : null))
       .then((cfg) => {
         if (cfg?.max_ipcams) setMaxIpcams(cfg.max_ipcams);
@@ -61,30 +64,30 @@ export default function CamerasPage() {
       .catch(() => {});
   }, []);
 
-  // stats 1초 polling — 등록 카메라별 {active, readers} (mediamtx path 상태).
+  // 카메라 상태 SSE — 연결하면 snapshot 으로 전체를 받고, 그 뒤로 바뀐 카메라만 update 로 받는다.
+  // 끊겨도 따로 표시하지 않고 마지막 상태를 유지한다 — 네트워크 오류는 브라우저가 알아서 다시 연결한다.
+  // 200 이 아닌 응답 등으로 CLOSED 가 되면 브라우저가 다시 연결하지 않아 3초 뒤 새로 연다.
   useEffect(() => {
-    let cancelled = false;
-    async function poll() {
-      const entries = await Promise.all(
-        cams.map(async (c) => {
-          try {
-            const resp = await fetch(`${apiBase()}/api/ipcams/${c.stream_key}/stats`);
-            if (!resp.ok) return [c.stream_key, { active: false, readers: 0 }] as const;
-            return [c.stream_key, (await resp.json()) as Stat] as const;
-          } catch {
-            return [c.stream_key, { active: false, readers: 0 }] as const;
-          }
-        })
-      );
-      if (!cancelled) setStats(Object.fromEntries(entries));
+    let source: EventSource;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    function open() {
+      source = new EventSource(`/api/ipcams/events`);
+      source.addEventListener("snapshot", (e) => setStats(JSON.parse(e.data)));
+      source.addEventListener("update", (e) => {
+        // 목록에 없는 카메라의 키는 저장만 되고 화면에는 나오지 않는다.
+        const { stream_key, ...stat } = JSON.parse(e.data) as Stat & { stream_key: string };
+        setStats((prev) => ({ ...prev, [stream_key]: stat }));
+      });
+      source.onerror = () => {
+        if (source.readyState === EventSource.CLOSED) retry = setTimeout(open, 3000);
+      };
     }
-    poll();
-    const timer = setInterval(poll, 1000);
+    open();
     return () => {
-      cancelled = true;
-      clearInterval(timer);
+      clearTimeout(retry);
+      source.close();
     };
-  }, [cams]);
+  }, []);
 
   const online = cams.filter((c) => stats[c.stream_key]?.active).length;
   const atCap = cams.length >= maxIpcams;
@@ -99,11 +102,21 @@ export default function CamerasPage() {
       // 사용자가 입력한 url 이 기존값(마스킹 :***@ 포함)과 다르면 스트림 변경(비번·주소 등).
       // 이름만 바꾼 편집은 여기서 false → remount 하지 않는다(불필요한 WHEP 재연결/깜빡임 방지).
       const urlChanged = rtspUrl !== editCam.rtsp_url;
-      const resp = await fetch(`${apiBase()}/api/ipcams/${editCam.id}`, {
+      const resp = await fetch(`/api/ipcams/${editCam.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, rtsp_url: rtspUrl }),
+        body: JSON.stringify({ name, rtsp_url: rtspUrl, version: editCam.version }),
       });
+      if (resp.status === 409) {
+        // 409 는 둘 중 하나다 — 다른 사람이 먼저 저장함(버전 충돌), 같은 카메라에 다른 작업이 진행 중.
+        // 창은 그대로 두고, 안내는 backend detail 을 보여 준다.
+        const message = await errorDetail(resp, "다른 사람이 먼저 수정했습니다 — 바뀐 값을 확인하고 다시 저장하세요");
+        const latest = (await fetchCams())?.find((c) => c.id === editCam.id);
+        // 버전이 바뀌었을 때만 입력란을 최신 값으로 채운다 (모달이 editCam 변경을 보고 채움).
+        // 버전이 그대로면 아직 아무도 저장하지 않은 것이라 내 입력을 둔다 — 덮으면 다시 저장할 때 내 수정이 사라진다.
+        if (latest && latest.version !== editCam.version) setEditCam(latest);
+        return message;
+      }
       if (!resp.ok) {
         // 백엔드 detail(예: 마스킹 *** 인 채 주소 변경 → 실비번 재입력 안내)을 그대로 노출.
         return await errorDetail(resp, "카메라 수정에 실패했습니다.");
@@ -114,7 +127,7 @@ export default function CamerasPage() {
         setPlayerEpoch((prev) => ({ ...prev, [id]: (prev[id] ?? 0) + 1 }));
       }
     } else {
-      const resp = await fetch(`${apiBase()}/api/ipcams`, {
+      const resp = await fetch(`/api/ipcams`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, rtsp_url: rtspUrl }),
@@ -131,9 +144,10 @@ export default function CamerasPage() {
 
   async function deleteCam(cam: Cam) {
     if (!window.confirm(`${cam.name} 삭제?`)) return;
-    const resp = await fetch(`${apiBase()}/api/ipcams/${cam.id}`, { method: "DELETE" });
+    const resp = await fetch(`/api/ipcams/${cam.id}`, { method: "DELETE" });
     if (!resp.ok) {
-      setError("카메라 삭제에 실패했습니다.");
+      // 백엔드 detail(예: 다른 작업 진행 중 409)을 그대로 노출 — PUT 경로와 일관.
+      setError(await errorDetail(resp, "카메라 삭제에 실패했습니다."));
       return;
     }
     await fetchCams();

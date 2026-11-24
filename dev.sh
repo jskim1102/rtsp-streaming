@@ -16,10 +16,12 @@ project_services() {
   # mediamtx(self-host, image-only)는 compose 수명주기로 별도 관리 — dev.sh 는 native 앱만.
   # backend: docker-entrypoint 동치 (alembic upgrade head 후 uvicorn, RULES §9) +
   #   native 는 mediamtx 를 호스트 게시포트로 호출(.env 의 docker DNS 값 override).
-  # frontend: compose build.args 로 넘기던 VITE_* 를 dev 에선 env 로 주입.
+  #   SSE 연결이 열려 있으면 --reload·종료가 멈춘다 — 8초 뒤 남은 연결을 끊는다.
+  # frontend: Vite 개발 서버가 /api 는 백엔드로, WHEP 는 MediaMTX 로 넘긴다 (배포의 frontend 프록시와 같은 경로).
+  #   VITE_ 이름은 화면 코드에 드러나므로 쓰지 않는다 — vite.config.ts 가 loadEnv 로 읽는다. 접두사 기본값은 backend 와 같다.
   SERVICES=(
-    "backend|backend|source .venv/bin/activate && export MEDIAMTX_API='http://127.0.0.1:${MEDIAMTX_API_PORT}' && export MEDIAMTX_PATH_PREFIX=${MEDIAMTX_PATH_PREFIX:-rtsp_streaming} && alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} --reload"
-    "frontend|frontend|VITE_API_PORT='${BACKEND_PORT}' VITE_MEDIAMTX_WEBRTC_PORT='${MEDIAMTX_WEBRTC_PORT}' VITE_MEDIAMTX_VIEWER_USER='${MEDIAMTX_VIEWER_USER:-viewer_rtsp_streaming}' VITE_MEDIAMTX_VIEWER_PASS='${MEDIAMTX_VIEWER_PASS:-}' exec npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT}"
+    "backend|backend|source .venv/bin/activate && export MEDIAMTX_API='http://127.0.0.1:${MEDIAMTX_API_PORT}' && export MEDIAMTX_PATH_PREFIX=${MEDIAMTX_PATH_PREFIX:-rtsp_streaming} && alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${BACKEND_PORT} --reload --timeout-graceful-shutdown 8"
+    "frontend|frontend|BACKEND_PORT='${BACKEND_PORT}' MEDIAMTX_WEBRTC_PORT='${MEDIAMTX_WEBRTC_PORT}' MEDIAMTX_PATH_PREFIX='${MEDIAMTX_PATH_PREFIX:-rtsp_streaming}' MEDIAMTX_VIEWER_USER='${MEDIAMTX_VIEWER_USER:-viewer_rtsp_streaming}' MEDIAMTX_VIEWER_PASS='${MEDIAMTX_VIEWER_PASS:-}' exec npm run dev -- --host 0.0.0.0 --port ${FRONTEND_PORT}"
   )
   PORTS=("${BACKEND_PORT}" "${FRONTEND_PORT}")
 }

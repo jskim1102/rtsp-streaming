@@ -10,10 +10,17 @@ _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_path)
 
 # 빈 문자열(set-but-empty)도 미설정으로 취급해 안전기본 폴백 (codex #3).
-#   os.getenv(k, default) 는 k 가 "" 면 ""(빈값)을 그대로 돌려준다 → CORS_ORIGINS="" → [""]
-#   (기본 * 아님 → CORS 차단), MAX_IPCAMS="" → int("") → ValueError(import 크래시).
+#   os.getenv(k, default) 는 k 가 "" 면 ""(빈값)을 그대로 돌려준다 → MAX_IPCAMS="" → int("") → ValueError(import 크래시).
 #   `or` 로 빈값=거짓 → 기본값으로 폴백한다.
-CORS_ORIGINS: str = os.getenv("CORS_ORIGINS") or "*"
+# CORS 기본값은 빈 값(다른 출처 허용 안 함)이다 — 화면과 API 가 같은 출처(frontend 프록시)라 열 필요가 없다.
+CORS_ORIGINS: str = os.getenv("CORS_ORIGINS") or ""
+
+
+def cors_origin_list(raw: str) -> list[str]:
+    """CORS_ORIGINS 문자열 → 허용 출처 목록. "*" 는 전체, 빈 값은 [] (빈 항목이 [""] 로 남지 않게, codex #3)."""
+    if raw == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 _raw_max_ipcams = int(os.getenv("MAX_IPCAMS") or "16")
 MAX_IPCAMS: int = max(1, min(64, _raw_max_ipcams))

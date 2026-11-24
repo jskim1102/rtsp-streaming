@@ -1,0 +1,148 @@
+# rtsp-streaming 프록시 — 화면·API·WHEP 신호의 단일 HTTPS 입구 (체크리스트 1번).
+# 컨테이너가 뜰 때 공식 이미지의 envsubst 가 ${…} 를 채워 /etc/nginx/conf.d/rtsp-streaming.conf 로 쓴다.
+# - 채우는 값은 docker-entrypoint.d/05-rtsp-streaming-env.envsh 가 export 한 것과 컨테이너 환경변수뿐이다.
+# - nginx 변수($http_host 등)는 환경변수 이름과 겹치지 않아 그대로 남는다.
+
+# backend·mediamtx 이름을 Docker 내장 DNS 로 10초마다 다시 찾는다.
+# - 컨테이너가 다시 만들어져 IP 가 바뀌어도 따라간다.
+# - 이름을 기동 때 한 번만 풀면, 그 컨테이너가 없을 때 nginx 가 아예 뜨지 않는다.
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+# 요청 제한 — 클라이언트 IP 는 프록시가 보는 접속 주소다. X-Forwarded-For 같은 전달 헤더는 믿지 않는다.
+# - /api: 초당 50회, WHEP: 초당 100회 (인터뷰에서 고른 값 — 처음 제안값의 5배).
+# - 탭 하나가 열 때 /api 3개 + 카메라마다 WHEP 1개라, 카메라 16대 화면 여러 탭에도 넉넉하다.
+# - 10m 은 nginx 문서의 예시값이다. 1MB 에 IPv4 상태 약 16,000개가 들어간다.
+limit_req_zone $binary_remote_addr zone=api:10m rate=50r/s;
+limit_req_zone $binary_remote_addr zone=whep:10m rate=100r/s;
+limit_conn_zone $binary_remote_addr zone=perip:10m;
+
+# 접근 로그 — 기본 형식에 요청 시간·프로토콜·연결 번호를 더한다.
+# 탭 여러 개가 HTTP/2 연결 하나를 나눠 쓰는지, 요청 제한에 걸린 IP 가 누구인지 볼 때 쓴다.
+log_format rtsp_streaming '$remote_addr - $remote_user [$time_local] "$request" '
+                          '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+                          '$request_time $server_protocol $connection';
+
+upstream rtsp_backend {
+    zone rtsp_backend 64k;
+    server backend:8000 resolve;
+}
+
+upstream rtsp_mediamtx {
+    zone rtsp_mediamtx 64k;
+    server mediamtx:8889 resolve;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name _;
+
+    # 40-rtsp-streaming-cert.sh 가 운영자 인증서나 자체 서명 인증서 중 하나를 이 경로로 연결한다.
+    ssl_certificate     /etc/nginx/active/tls.crt;
+    ssl_certificate_key /etc/nginx/active/tls.key;
+
+    # 같은 포트로 온 평문 HTTP(497)는 브라우저가 접속한 호스트·포트·경로 그대로 HTTPS 로 넘긴다.
+    # $server_port 는 컨테이너 포트(443)라 쓰지 않는다 — 호스트 포트는 FRONTEND_PORT 다.
+    error_page 497 =301 https://$http_host$request_uri;
+
+    access_log /var/log/nginx/access.log rtsp_streaming;
+
+    # 동시에 처리 중인 요청(열려 있는 SSE·WHEP 포함) 수 — HTTP/2 에서는 요청마다 하나로 센다.
+    limit_conn perip 250;
+    limit_req_status 429;
+    limit_conn_status 429;
+
+    # 이 모듈의 API 요청 본문과 WHEP 의 SDP 는 수 KB 이하다.
+    client_max_body_size 64k;
+
+    # 보안 헤더 — merge 라서 add_header 가 있는 하위 location(/assets/, = /index.html)도 물려받는다.
+    add_header_inherit merge;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+
+    root  /usr/share/nginx/html;
+    index index.html;
+
+    # gzip — 텍스트 자산 전송량 감소
+    # text/event-stream 은 넣지 않는다 — SSE 를 압축하면 이벤트가 바로 나가지 않는다.
+    gzip               on;
+    gzip_vary          on;
+    gzip_min_length    1024;
+    gzip_proxied       any;
+    gzip_comp_level    6;
+    gzip_types         text/plain text/css application/javascript application/json image/svg+xml;
+
+    # ─── 훅 알림 주소 차단 ───
+    # MediaMTX 는 내부망으로 backend 에 직접 훅을 보낸다. 밖에서 온 /internal 요청은 넘기지 않는다.
+    # location 은 정규화한 경로(퍼센트 디코딩, .. 합침)로 고르므로 /INTERNAL, /api/../internal 같은 표기도 여기 걸린다.
+    location ~* ^/internal(/|$) {
+        return 404;
+    }
+
+    # ─── WHEP 신호 ───
+    # 이 모듈 형식의 경로(<접두사>__ipcam-<소문자 16진수>)만 MediaMTX 로 넘긴다.
+    # (/|$) 로 세션 생성(POST …/whep)과 Location 의 후속 요청(…/whep/<id>)을 함께 받는다.
+    # viewer 자격증명은 여기서 붙인다 — 화면 번들과 브라우저 응답에는 들어가지 않는다. 브라우저가 보낸 값은 덮어쓴다.
+    # 자격증명이 틀렸을 때 브라우저가 로그인 창을 띄우지 않도록 WWW-Authenticate 를 지운다.
+    location ~ ^/${WHEP_PATH_PREFIX}[0-9a-f]+/whep(/|$) {
+        limit_req zone=whep burst=500 nodelay;
+        proxy_pass http://rtsp_mediamtx;
+        proxy_set_header Authorization "${VIEWER_AUTHORIZATION}";
+        proxy_hide_header WWW-Authenticate;
+    }
+
+    # 형식이 다른 이름의 WHEP 요청은 SPA fallback(200 index.html) 대신 404 — 위 location 뒤에 둬야 한다.
+    # 첫 단계 이름만 보므로 /api/…/whep 같은 깊은 경로는 막지 않는다.
+    location ~ ^/[^/]+/whep(/|$) {
+        return 404;
+    }
+
+    # ─── API ───
+    # proxy_pass 에 URI 를 붙이지 않아 클라이언트가 보낸 경로를 그대로 넘긴다.
+    # /api 아래로 남는 표기(/api/a/../b)는 backend 가 .. 를 다시 풀지 않아 /internal 라우트에 닿지 않는다.
+    # 순간 250회까지는 바로 처리하고, 넘는 요청은 기다리게 하지 않고 즉시 429 (nodelay).
+    location /api/ {
+        limit_req zone=api burst=250 nodelay;
+        error_page 429 @api_429;
+        proxy_pass http://rtsp_backend;
+    }
+
+    # SSE — /api/ 와 형제 location 이라 아무것도 물려받지 않아 넘김 설정을 다시 적는다.
+    # 버퍼링하지 않아 이벤트가 바로 나간다 (backend 도 X-Accel-Buffering: no 를 보내지만 거기 기대지 않는다).
+    # 읽기 시간 제한은 15초 keep-alive 마다 다시 시작돼, 연결이 열려 있는 동안에는 걸리지 않는다.
+    # 1시간은 backend 가 멈춰 아무것도 보내지 않을 때만 끊는 값이다.
+    location = /api/ipcams/events {
+        limit_req zone=api burst=250 nodelay;
+        error_page 429 @api_429;
+        proxy_pass http://rtsp_backend;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 1h;
+    }
+
+    # /api 아래의 429(요청 횟수·동시 요청 어느 쪽이든) — 다른 API 오류처럼 detail 문구를 주어 화면이 그대로 보여 준다.
+    location @api_429 {
+        default_type "application/json; charset=utf-8";
+        return 429 '{"detail":"요청이 너무 많습니다 — 잠시 후 다시 시도하세요"}';
+    }
+
+    # ─── 정적 자산 (Vite 는 파일명에 content hash 를 넣으므로 장기 캐시 안전) ───
+    location /assets/ {
+        expires    1y;
+        add_header Cache-Control "public, immutable";
+        try_files  $uri =404;
+    }
+
+    # ─── SPA fallback ───
+    # 파일이 없는 경로로 직접 접속/새로고침해도 index.html 을 반환한다.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # index.html 자체는 캐시하지 않음 — 배포 직후 사용자가 최신 번들을 받도록
+    location = /index.html {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+    }
+}

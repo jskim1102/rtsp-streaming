@@ -6,18 +6,50 @@ mediamtx 컨테이너가 한다. v1 에서 떼냈던 경로를 v2 에서 복원�
 
 import logging
 import subprocess
+import threading
+import weakref
+from collections.abc import Callable
 
 import httpx
 from sqlalchemy.orm import Session
 
+from app import stream_status
 from app.config import MEDIAMTX_API, MEDIAMTX_BACKEND_PASS, MEDIAMTX_BACKEND_USER
 from app.masking import mask_rtsp_credentials
-from app.models import IpCam
+from app.models import IpCam, stream_key_prefix
+from app.stream_status import PathStatus, StreamStatusHub
 
 logger = logging.getLogger("rtsp-streaming.mediamtx")
 
+# 동기화 주기 — 영상 플레이어 재접속 시도(약 30초) 안에 path 가 복구되도록 짧게 둔다.
+# 한 주기의 기본 부하는 mediamtx 목록 조회 1회다.
+SYNC_INTERVAL_SEC = 5.0
 
-def _validate_rtsp_url(rtsp_url: str) -> None:
+# 카메라별 작업 잠금 — stream_key 마다 하나. 등록·수정·삭제 API 와 동기화가 같은 카메라를 동시에 건드리지 않게 한다.
+# DB 쓰기 락과 별개다 — 다른 카메라 작업과 DB 는 막지 않는다.
+# 백엔드가 프로세스 1개라는 가정이다 (여러 개면 프로세스마다 따로라 효과가 없다).
+# 약한 참조로 둔다 — 아무도 잡고 있지 않은 잠금은 저절로 사라진다.
+# 그렇지 않으면 실패한 등록 요청(새 stream_key)마다 항목이 하나씩 영구히 쌓인다.
+_camera_locks: "weakref.WeakValueDictionary[str, threading.Lock]" = weakref.WeakValueDictionary()
+_camera_locks_guard = threading.Lock()
+
+
+def camera_lock(stream_key: str) -> threading.Lock:
+    """그 카메라의 작업 잠금 — 같은 stream_key 면 늘 같은 잠금을 돌려준다.
+
+    - 부르는 쪽은 `acquire(blocking=False)` 로 기다리지 않고 시도한다.
+    - API 는 잡혀 있으면 409, 동기화는 그 카메라를 이번 주기만 건너뛴다.
+    """
+    with _camera_locks_guard:
+        lock = _camera_locks.get(stream_key)
+        if lock is None:
+            # 누군가 잡고 있는 동안에는 그 참조가 살아 있어 같은 잠금을 돌려준다.
+            lock = threading.Lock()
+            _camera_locks[stream_key] = lock
+        return lock
+
+
+def validate_rtsp_url(rtsp_url: str) -> None:
     """rtsp_url 트러스트 경계 검증 (injection 2중 방어의 1단 — spec v2-transcode-binding §영향).
 
     - 스킴은 `rtsp://` 또는 `rtsps://`(TLS) 만 허용.
@@ -43,7 +75,7 @@ def _validate_rtsp_url(rtsp_url: str) -> None:
         )
 
 
-def _probe_codec(rtsp_url: str) -> str | None:
+def probe_codec(rtsp_url: str) -> str | None:
     """카메라 첫 비디오 스트림의 코덱명 감지 (ffprobe) — h264=passthrough/else=libx264 결정용.
 
     `ffprobe -select_streams v:0 -show_entries stream=codec_name` 로 코덱(h264/hevc/mjpeg…)을
@@ -56,29 +88,32 @@ def _probe_codec(rtsp_url: str) -> str | None:
             ["ffprobe", "-rtsp_transport", "tcp", "-v", "error",
              "-select_streams", "v:0", "-show_entries", "stream=codec_name",
              "-of", "default=nw=1:nk=1", "-i", rtsp_url],
-            capture_output=True, text=True, timeout=4,
+            # 카메라가 UTF-8 이 아닌 오류 문구(예: EUC-KR)를 보내도 디코드가 실패하지 않게 바꿔 읽는다.
+            capture_output=True, text=True, errors="replace", timeout=4,
         )
         codec = proc.stdout.strip().lower()
         return codec or None
-    except (subprocess.SubprocessError, OSError):
+    except Exception:
+        # 어떤 실패든 None — 예외가 새면 등록 API·동기화 주기가 중간에 끊긴다.
         logger.warning("ffprobe 코덱 감지 실패 → libx264 폴백: %s", mask_rtsp_credentials(rtsp_url))
         return None
 
 
-def _transcode_command(rtsp_url: str) -> str:
+def _transcode_command(rtsp_url: str, codec: str | None) -> str:
     """runOnDemand transcode 커맨드 — h264 소스는 무손실 passthrough, 그 외는 libx264.
 
-    셸 없이 ffmpeg 를 직접 exec 한다(mediamtx 가 공백분리 후 직접 실행). 등록 시점에
-    `_probe_codec` 로 코덱을 감지해 **정적 커맨드**를 만든다 — 셸 변수($C/$V) 분기를 쓰지
+    셸 없이 ffmpeg 를 직접 exec 한다(mediamtx 가 공백분리 후 직접 실행). 호출부가 판별한
+    코덱(`probe_codec` 결과, DB 에 저장된 값)으로 **정적 커맨드**를 만든다 — 셸 변수($C/$V) 분기를 쓰지
     않으므로 mediamtx 의 $VAR 치환과 충돌하지 않는다(3개 모듈이 포기했던 함정 회피).
+    판별은 등록·주소 수정 때 한 번만 하고 저장해 재사용한다 — 재등록 때마다 ffprobe(최대 4초)를 돌리지 않게.
       - h264: `-c:v copy` 무손실 패스스루(재인코딩 0 → 화질 보존·CPU 0). WebRTC 네이티브
         코덱이라 그대로 송출. IDR 간격은 카메라 GOP 를 따른다(copy 라 강제 불가).
-      - 그 외(H.265/MJPEG…) 또는 probe 실패: libx264 재인코딩(WebRTC 호환 보장) +
+      - 그 외(H.265/MJPEG…) 또는 코덱 모름(None): libx264 재인코딩(WebRTC 호환 보장) +
         `-force_key_frames` 2초 IDR 강제(저fps 카메라 WHEP join 지연 방지).
-    rtsp_url 은 `_validate_rtsp_url`(공백/제어문자/셸메타 거부)로 검증돼 안전하게 인자로 들어간다.
+    rtsp_url 은 `validate_rtsp_url`(공백/제어문자/셸메타 거부)로 검증돼 안전하게 인자로 들어간다.
     `$RTSP_PORT`/`$MTX_PATH` 는 mediamtx 변수 — 정상 치환된다.
     """
-    if _probe_codec(rtsp_url) == "h264":
+    if codec == "h264":
         video = "-c:v copy"
     else:
         video = ("-c:v libx264 -preset veryfast -tune zerolatency "
@@ -110,19 +145,20 @@ def _auth() -> tuple[str, str] | None:
     return (MEDIAMTX_BACKEND_USER, MEDIAMTX_BACKEND_PASS) if MEDIAMTX_BACKEND_PASS else None
 
 
-def register_stream(stream_key: str, rtsp_url: str) -> bool:
+def register_stream(stream_key: str, rtsp_url: str, codec: str | None = None) -> bool:
     """mediamtx 에 path 등록 — 조건부 transcode runOnDemand (패턴 C).
 
     `{source: rtsp}` 패스스루 대신 runOnDemand 로 등록해 H.264 외 코덱을 재인코딩한다.
-    rtsp_url 은 bash 에 들어가므로 검증 후 사용.
+    rtsp_url 은 runOnDemand 의 ffmpeg 인자로 들어가므로(셸 없이 실행) 검증 후 사용.
+    codec 은 호출부가 판별·저장한 값이다 — 이 함수는 ffprobe 를 돌리지 않는다. None 이면 libx264.
     """
     _require_api()
-    _validate_rtsp_url(rtsp_url)
+    validate_rtsp_url(rtsp_url)
     try:
         resp = httpx.post(
             f"{MEDIAMTX_API}/v3/config/paths/add/{stream_key}",
             json={
-                "runOnDemand": _transcode_command(rtsp_url),
+                "runOnDemand": _transcode_command(rtsp_url, codec),
                 "runOnDemandCloseAfter": "10s",
             },
             auth=_auth(),
@@ -139,7 +175,7 @@ def register_stream(stream_key: str, rtsp_url: str) -> bool:
         return False
 
 
-def update_stream(stream_key: str, rtsp_url: str) -> bool:
+def update_stream(stream_key: str, rtsp_url: str, codec: str | None = None) -> bool:
     """기존 mediamtx path 의 runOnDemand 를 새 rtsp_url 로 **원자적 부분 갱신** (PATCH).
 
     `PATCH /v3/config/paths/patch/{key}` — runOnDemand 만 교체하고 나머지 path 설정은 보존한다
@@ -148,13 +184,14 @@ def update_stream(stream_key: str, rtsp_url: str) -> bool:
     config 를 **그대로 보존**해 카메라 암전이 없다. stream_key 가 update 전후 동일하므로 PATCH 가
     정확히 맞는다. 존재하지 않는 path 면 404(이 함수는 등록된 카메라 update 경로에서만 호출).
     HTTP 메서드는 PATCH (POST 면 404 — mediamtx 가 verb 로 구분).
+    codec 은 register_stream 과 같다 — 호출부가 판별한 값을 넘긴다.
     """
     _require_api()
-    _validate_rtsp_url(rtsp_url)
+    validate_rtsp_url(rtsp_url)
     try:
         resp = httpx.patch(
             f"{MEDIAMTX_API}/v3/config/paths/patch/{stream_key}",
-            json={"runOnDemand": _transcode_command(rtsp_url)},
+            json={"runOnDemand": _transcode_command(rtsp_url, codec)},
             auth=_auth(),
             timeout=5,
         )
@@ -197,47 +234,154 @@ def remove_stream(stream_key: str) -> bool:
         return False
 
 
-def sync_streams(db: Session) -> None:
-    """서버 시작 시 DB 의 모든 IP CAM 을 mediamtx 에 재등록"""
-    cams = db.query(IpCam).all()
-    for cam in cams:
-        register_stream(cam.stream_key, cam.rtsp_url)
-    logger.info("mediamtx 동기화 완료: %d개 스트림", len(cams))
+def list_config_paths() -> set[str] | None:
+    """mediamtx 에 설정된 path 이름 목록 (`GET /v3/config/paths/list`).
 
-
-def get_path(stream_key: str) -> dict | None:
-    """mediamtx path 상태 조회 (/v3/paths/get/<path>).
-
-    반환은 mediamtx 응답 dict (`ready`, `readers` 등) 또는 path 없으면 None.
+    - 성공: path 이름 집합. 카메라 상한 64대 + all_others 라 기본 페이지(100개) 하나에 다 들어온다.
+    - 실패(연결 실패·200 아님): None — 호출부가 '경로 없음'과 구분해 그 주기를 건너뛴다.
+    - 로그를 남기지 않는다 — 5초마다 실패할 수 있어 동기화가 연결 상태가 바뀔 때만 남긴다.
     """
     _require_api()
     try:
-        resp = httpx.get(f"{MEDIAMTX_API}/v3/paths/get/{stream_key}", auth=_auth(), timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
-        return None
+        resp = httpx.get(f"{MEDIAMTX_API}/v3/config/paths/list", auth=_auth(), timeout=5)
     except httpx.HTTPError:
-        logger.exception("mediamtx path 조회 실패: %s", stream_key)
         return None
+    if resp.status_code != 200:
+        return None
+    return {item["name"] for item in resp.json()["items"]}
 
 
-def ensure_stream(db: Session, stream_key: str) -> dict | None:
-    """self-heal + 현재 path 반환 — mediamtx 에 path 가 없으면 DB 의 rtsp_url 로 재등록.
+def list_path_status() -> dict[str, PathStatus] | None:
+    """mediamtx path 상태 목록 (`GET /v3/paths/list`) — 이 모듈 형식의 path 만 고른다.
 
-    mediamtx 컨테이너가 독립 재시작(recreate·crash·reboot)되면 동적 등록한 path 가
-    소멸한다. backend 는 startup·카메라등록 때만 등록하므로 그대로면 "path not
-    configured" 로 영상이 끊긴다. 이 함수를 카메라별 backend 접점(stats 폴링)에서
-    호출해 누락이 감지되면 즉시 재등록한다(register_stream 은 idempotent).
-
-    반환: 현재 mediamtx path dict(이미 등록됐거나 재등록 직후), 없으면 None. 호출부(stats
-    폴링)가 이 반환값을 그대로 재사용해 폴당 get_path 중복호출(2N httpx)을 1회로 줄인다.
+    - 성공: `{stream_key: PathStatus(ready, 시청 세션 ID 집합)}`. 시청 세션 ID 는 훅의 MTX_READER_ID 와 같다.
+    - 실패(연결 실패·200 아님): None. 설정 목록과 같은 이유로 로그를 남기지 않는다.
+    - 설정 목록과 같은 이유로 기본 페이지(100개) 하나에 다 들어온다.
     """
-    path = get_path(stream_key)
-    if path:
-        return path  # 이미 등록됨 — 불필요한 POST 회피 + 호출부 재사용용 반환
-    cam = db.query(IpCam).filter(IpCam.stream_key == stream_key).first()
-    if not cam:
-        return None  # DB 에 없는 카메라 — 재등록 대상 아님
-    logger.info("mediamtx path 누락 감지 → 자가복구 재등록: %s", stream_key)
-    register_stream(cam.stream_key, cam.rtsp_url)
-    return get_path(stream_key)  # 재등록 직후 최신 path (on-demand 라 보통 아직 not ready)
+    _require_api()
+    try:
+        resp = httpx.get(f"{MEDIAMTX_API}/v3/paths/list", auth=_auth(), timeout=5)
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    prefix = stream_key_prefix()
+    return {
+        item["name"]: PathStatus(item["ready"], {reader["id"] for reader in item["readers"]})
+        for item in resp.json()["items"]
+        if item["name"].startswith(prefix)
+    }
+
+
+class StreamReconciler:
+    """DB 카메라 목록에 mediamtx path 를 맞추고 상태를 보정한다 — 요청 처리와 분리된 백그라운드 동기화.
+
+    - 상태 확인: mediamtx 상태 목록으로 상태 저장소(hub)를 바로잡는다. 훅이 빠지거나 순서가 뒤바뀐 경우의 보정이다.
+    - 빠진 path(DB 에만 있음): 재등록한다. mediamtx 가 재시작되면 동적 등록한 path 가 사라진다.
+    - 남은 path(mediamtx 에만 있음): 이 모듈 형식만, 두 주기 연속 보이면 지운다.
+    - API 가 작업 중인 카메라(카메라 잠금이 잡힘)는 재등록하지 않고 다음 주기로 미룬다.
+    - mediamtx 조회 실패: 그 주기를 건너뛴다. 실패를 '경로 없음'으로 보면 재등록이 폭주한다.
+    - 주기 사이에 남은 path 후보와 직전 연결 상태를 기억하므로 인스턴스 하나를 계속 쓴다.
+    """
+
+    def __init__(self, hub: StreamStatusHub) -> None:
+        self._hub = hub
+        self._orphan_candidates: set[str] = set()  # 직전 주기에 처음 본 남은 path
+        self._connected: bool | None = None  # None = 첫 조회 전 (첫 성공은 '다시 연결됨'으로 보지 않음)
+
+    def run_once(self, db: Session) -> None:
+        """동기화 한 주기 — 상태 확인 → DB 읽기 → mediamtx 목록 조회 → 빠진 path 재등록 → 남은 path 정리."""
+        # 상태 확인을 맨 앞에 둔다 — 대량 재등록으로 주기가 길어져도 주기마다 먼저 보정한다.
+        # 상태 목록 조회만 실패하면 이 단계만 건너뛴다 — 끊김 판단은 아래 설정 목록 기준이다.
+        statuses = list_path_status()
+        if statuses is not None:
+            self._hub.replace_all(statuses)
+
+        # DB 를 먼저 읽는다 — 목록을 먼저 읽으면 쓸데없는 재등록(400)이 생긴다.
+        # 목록과 DB 읽기 사이에 등록 API 가 등록까지 마친 카메라가 '빠진 path' 로 보이기 때문이다.
+        cams = {stream_key for (stream_key,) in db.query(IpCam.stream_key).all()}
+
+        # 조회 실패는 '경로 없음'이 아니다 — 등록·삭제 없이 끝낸다.
+        # 로그는 연결 상태가 바뀌는 순간에만 남긴다 (끊김 1줄, 다시 연결됨 1줄).
+        paths = list_config_paths()
+        if paths is None:
+            if self._connected is not False:
+                logger.warning("mediamtx 연결 끊김 — 동기화를 건너뛴다")
+                # 끊긴 순간 한 번만 화면을 모두 꺼짐으로 바꾼다.
+                # 끊긴 동안 훅이 오면(설정 조회만 실패하는 경우) 그 값을 덮어쓰지 않는다.
+                self._hub.mark_all_inactive()
+            self._connected = False
+            return
+        if self._connected is False:
+            logger.info("mediamtx 다시 연결됨 — 동기화를 재개한다")
+        self._connected = True
+
+        # 빠진 path 를 한 대씩 재등록한다 — 동시 등록은 하지 않는다.
+        # 한 대에 등록 요청(최대 5초)이 걸린다. 코덱을 모르는 카메라는 ffprobe(최대 4초)가 더 든다.
+        for stream_key in sorted(cams - paths):
+            # 한 대의 실패(판별·DB 오류 등)가 나머지 카메라의 재등록과 남은 path 정리를 막지 않게 한다.
+            try:
+                self._register_missing(db, stream_key)
+            except Exception:
+                logger.exception("mediamtx path 재등록 실패: %s", stream_key)
+                db.rollback()
+
+        # 남은 path 는 이 모듈 형식만 대상이다 — all_others·다른 프로젝트 path 는 건드리지 않는다.
+        # 처음 보면 후보로만 둔다 — 위에서 DB 를 읽은 뒤 등록 API 가 커밋·등록을 마친 카메라일 수 있다.
+        # 다음 주기에도 보이면 지운다. 제거에 실패하면 후보로 남아 다음 주기에 다시 시도한다.
+        orphans = {p for p in paths - cams if p.startswith(stream_key_prefix())}
+        for stream_key in sorted(orphans & self._orphan_candidates):
+            if remove_stream(stream_key):
+                logger.info("DB 에 없는 mediamtx path 제거: %s", stream_key)
+                orphans.discard(stream_key)
+        self._orphan_candidates = orphans
+
+    @staticmethod
+    def _register_missing(db: Session, stream_key: str) -> None:
+        """빠진 path 하나를 재등록한다 — 실패하면 다음 주기에 다시 시도된다."""
+        # API 가 그 카메라를 작업 중이면 기다리지 않고 이번 주기만 건너뛴다.
+        # 등록 API 는 커밋 뒤 등록을 마칠 때까지 잠금을 잡으므로, 같은 path 를 먼저 등록하지 않는다.
+        lock = camera_lock(stream_key)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            # 주기 처음에 읽은 DB 목록은 낡았을 수 있어 잠금 안에서 다시 읽는다.
+            # 그 사이 지워졌으면 등록하지 않고(지운 카메라를 되살리지 않음), 주소가 바뀌었으면 새 주소로 등록한다.
+            cam = db.query(IpCam).filter(IpCam.stream_key == stream_key).first()
+            if cam is None:
+                return
+            # 저장된 코덱을 쓴다 — 대량 재등록에서 카메라마다 ffprobe(최대 4초)를 돌리지 않는다.
+            # 모르면(등록 때 카메라가 꺼져 있었거나 마이그레이션 전 카메라) 지금 판별하고, 성공하면 저장한다.
+            if cam.codec is None:
+                cam.codec = probe_codec(cam.rtsp_url)
+                db.commit()
+            # 판별이 실패해도(카메라 꺼짐 등) 재인코딩 명령으로 등록은 성공한다.
+            logger.info("mediamtx path 누락 → 재등록: %s", stream_key)
+            register_stream(stream_key, cam.rtsp_url, cam.codec)
+        finally:
+            lock.release()
+
+
+def run_sync_loop(
+    stop: threading.Event,
+    session_factory: Callable[[], Session],
+    interval: float = SYNC_INTERVAL_SEC,
+) -> None:
+    """백그라운드 스레드 본체 — stop 이 켜질 때까지 동기화를 반복한다.
+
+    - 서버 시작 직후 첫 주기를 돌고, 한 주기가 끝나면 interval 초 쉰다 (고정 간격 아님).
+    - 주기마다 세션을 새로 열고 닫는다 — 오래 연 세션이 커넥션을 붙잡지 않게.
+    - session_factory·interval 을 받아 테스트가 가짜 세션·0초 대기로 돌릴 수 있다.
+    """
+    reconciler = StreamReconciler(stream_status.hub)
+    while not stop.is_set():
+        db = session_factory()
+        try:
+            reconciler.run_once(db)
+        except Exception:
+            # 주기 하나의 예외로 스레드가 멈추면 복구가 조용히 끊긴다 — 로그만 남기고 다음 주기로.
+            logger.exception("mediamtx 동기화 주기 실패")
+        finally:
+            db.close()
+        # 종료 신호가 오면 대기 중에도 바로 깨어난다.
+        stop.wait(interval)

@@ -28,6 +28,11 @@ __pycache__/
 node_modules/
 dist/
 
+# HTTPS 인증서 (운영자 인증서·자동 생성 인증서).
+# 폴더는 .gitkeep 으로 checkout 에 남긴다 — 없으면 Docker 가 root 소유로 만들어 운영자가 인증서를 넣을 수 없다.
+certs/*
+!certs/.gitkeep
+
 # misc
 .DS_Store
 *.log

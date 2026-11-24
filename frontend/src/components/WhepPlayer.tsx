@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { whepBase, whepAuthHeaders } from "../hooks/useApi";
 
 interface Props {
   streamKey: string;
@@ -99,9 +98,10 @@ export default function WhepPlayer({ streamKey, onFps }: Props) {
           const offer = await conn.createOffer();
           await conn.setLocalDescription(offer);
 
-          const resp = await fetch(`${whepBase()}/${streamKey}/whep`, {
+          // 같은 출처의 프록시로 보낸다 — viewer 자격증명은 프록시(배포)·개발 서버(dev.sh)가 붙인다.
+          const resp = await fetch(`/${streamKey}/whep`, {
             method: "POST",
-            headers: { "Content-Type": "application/sdp", ...whepAuthHeaders() },
+            headers: { "Content-Type": "application/sdp" },
             body: offer.sdp,
           });
           if (!resp.ok) throw new Error(`WHEP ${resp.status}`);

@@ -130,4 +130,4 @@ if ($LASTEXITCODE -ne 0) {
 
 $port = EnvGet 'FRONTEND_PORT'
 Write-Host ''
-Write-Host "설치 완료 — 브라우저에서 http://localhost:$port 에 접속하세요." -ForegroundColor Green
+Write-Host "설치 완료 — 브라우저에서 https://localhost:$port 에 접속하세요." -ForegroundColor Green

@@ -1,5 +1,4 @@
 from logging.config import fileConfig
-from pathlib import Path
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
@@ -15,20 +14,13 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# --- target_metadata: app.database 가 존재할 때만 autogenerate 지원 -----------
-# phase1 에는 app.database 가 아직 없으므로 try-import 후 None 으로 폴백한다.
-# 첫 migration 은 명시적 op.create_table 이라 app 모듈 import 가 필요 없고,
-# phase3 에서 database.py 가 들어오면 자동으로 Base.metadata 를 픽업한다.
-try:
-    from app.database import Base, DATABASE_URL  # noqa: F401
-    target_metadata = Base.metadata
-    _database_url = DATABASE_URL
-except ImportError:
-    target_metadata = None
-    # app.database 부재 시 self-contained 경로 — database.py 와 동일하게
-    # backend/deepeye.db 를 가리킨다 (env.py 는 backend/alembic/ 에 위치).
-    _db_path = Path(__file__).resolve().parent.parent / "deepeye.db"
-    _database_url = f"sqlite:///{_db_path}"
+# --- target_metadata·DB 주소: app.database 에서 가져온다 -----------------------
+# 마이그레이션은 앱과 같은 DATABASE_URL 에 적용된다.
+# app.models 는 import 하지 않아 Base.metadata 가 비어 있다 — autogenerate 를 쓰려면 먼저 import 해야 한다.
+from app.database import Base, DATABASE_URL
+
+target_metadata = Base.metadata
+_database_url = DATABASE_URL
 
 # alembic.ini 의 placeholder URL 대신 위에서 결정한 URL 을 사용.
 config.set_main_option("sqlalchemy.url", _database_url)

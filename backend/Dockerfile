@@ -42,4 +42,6 @@ EXPOSE 8000
 # 절대경로의 /bin/sh로 실행해 shebang·호스트 실행권한에 의존하지 않는다.
 # 스크립트의 exec "$@"가 uvicorn을 PID 1로 교체한다.
 ENTRYPOINT ["/bin/sh", "/app/docker-entrypoint.sh"]
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# SSE 연결이 열려 있으면 uvicorn 이 종료에서 멈춘다 — 8초 뒤 남은 연결을 끊고 내려간다.
+# Docker 강제 종료(10초)보다 먼저 끝나 종료 처리가 실행된다.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "8"]
