@@ -9,6 +9,7 @@ from app.config import CORS_ORIGINS, MAX_IPCAMS, logger
 from app.database import SessionLocal, init_db
 from app.ipcam import router as ipcam_router
 from app.mediamtx import run_sync_loop
+from app.stream_status import hook_router
 
 
 @asynccontextmanager
@@ -44,6 +45,7 @@ app.add_middleware(
 )
 
 app.include_router(ipcam_router)
+app.include_router(hook_router)
 
 
 @app.get("/api/health")

@@ -1,9 +1,10 @@
 """Ip CAM CRUD characterization + 16대 cap (net-new) 테스트.
 
-CRUD list/create/update/delete/stats 는 추출 코드의 기존 동작을 고정(characterization).
+CRUD list/create/update/delete 는 추출 코드의 기존 동작을 고정(characterization).
 16대 cap 은 net-new 로직 → 명시적 경계 테스트(16 OK, 17번째 409).
 """
 
+import json
 import os
 import tempfile
 from unittest.mock import patch
@@ -18,20 +19,17 @@ from sqlalchemy.orm import sessionmaker
 def mtx():
     """ipcam.py 가 호출하는 mediamtx 함수를 mock — 실 httpx 호출 차단.
 
-    create=register_stream(add), update=update_stream(PATCH), delete=remove_stream(끝상태 bool),
-    stats=get_path(조회만, path dict|None 반환). get_path 기본값 None(=path 없음),
-    remove 기본값 True(=제거 성공) — stats/delete 로직을 격리한다 (각 함수 자체 동작은
+    create=register_stream(add), update=update_stream(PATCH), delete=remove_stream(끝상태 bool).
+    remove 기본값 True(=제거 성공) — delete 로직을 격리한다 (각 함수 자체 동작은
     test_mediamtx.py 단위테스트가 검증).
     """
     with patch("app.ipcam.register_stream") as register, \
          patch("app.ipcam.update_stream") as update, \
-         patch("app.ipcam.remove_stream") as remove, \
-         patch("app.ipcam.get_path") as get_path:
+         patch("app.ipcam.remove_stream") as remove:
         register.return_value = True
         update.return_value = True
         remove.return_value = True
-        get_path.return_value = None
-        yield {"register": register, "update": update, "remove": remove, "get_path": get_path}
+        yield {"register": register, "update": update, "remove": remove}
 
 
 @pytest.fixture()
@@ -235,46 +233,51 @@ def test_delete_succeeds_when_sweep_fails(client, mtx):
     assert client.get("/api/ipcams").json() == []  # commit 됐으니 row 없음
 
 
-# ─── net-new: stats mediamtx /v3/paths/get 기반 (test-first) ───
+# ─── SSE 상태 푸시 (카메라별 stats 폴링 대체) ───
 
 
-def test_stats_active_with_readers(client, mtx):
-    cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
-    # mediamtx path 조회 결과 — ready=true + readers 2개
-    mtx["get_path"].return_value = {"ready": True, "readers": [{}, {}]}
-    resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
-    assert resp.status_code == 200
-    assert resp.json() == {"active": True, "readers": 2}
+@pytest.fixture()
+def hub():
+    """테스트마다 새 상태 저장소를 쓴다."""
+    from app.stream_status import StreamStatusHub
+
+    h = StreamStatusHub()
+    with patch("app.stream_status.hub", h):
+        yield h
 
 
-def test_stats_inactive_when_path_missing(client, mtx):
-    cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
-    # path 없음 → None
-    mtx["get_path"].return_value = None
-    resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
-    assert resp.status_code == 200
-    assert resp.json() == {"active": False, "readers": 0}
+def _next_event(lines) -> tuple[str, dict]:
+    """SSE 줄 스트림에서 다음 이벤트 하나(event, data)를 읽는다 — keep-alive 주석은 건너뛴다."""
+    event = data = None
+    for line in lines:
+        if line.startswith("event: "):
+            event = line.removeprefix("event: ")
+        elif line.startswith("data: "):
+            data = json.loads(line.removeprefix("data: "))
+        elif line == "" and event:
+            return event, data
+    raise AssertionError("SSE 이벤트가 오지 않았다")
 
 
-def test_stats_inactive_when_not_ready(client, mtx):
-    cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
-    # path 존재하나 아직 ready 아님 (source 연결 전)
-    mtx["get_path"].return_value = {"ready": False, "readers": []}
-    resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
-    assert resp.status_code == 200
-    assert resp.json() == {"active": False, "readers": 0}
+def test_events_sends_mediamtx_status_snapshot_first(client, hub):
+    from app.stream_status import PathStatus
+
+    statuses = {"ipcam-a": PathStatus(True, {"r1"})}
+    with patch("app.ipcam.list_path_status", return_value=statuses), \
+         client.stream("GET", "/api/ipcams/events") as resp:
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        assert _next_event(resp.iter_lines()) == ("snapshot", {"ipcam-a": {"active": True, "readers": 1}})
 
 
-def test_stats_only_reads_and_never_registers(client, mtx):
-    """stats 는 조회만 한다 — path 가 없어도 재등록하지 않는다(재등록은 백그라운드 동기화 몫)."""
-    cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
-    mtx["register"].reset_mock()
-    mtx["get_path"].return_value = None
-    resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
-    assert resp.status_code == 200
-    assert resp.json() == {"active": False, "readers": 0}
-    mtx["get_path"].assert_called_once_with(cam["stream_key"])
-    mtx["register"].assert_not_called()
+def test_events_pushes_hook_updates_after_snapshot(client, hub):
+    with patch("app.ipcam.list_path_status", return_value={}), \
+         client.stream("GET", "/api/ipcams/events") as resp:
+        lines = resp.iter_lines()
+        _next_event(lines)
+
+        hub.apply_hook("ready", "ipcam-a", None)
+
+        assert _next_event(lines) == ("update", {"stream_key": "ipcam-a", "active": True, "readers": 0})
 
 
 # ─── net-new: 16대 cap (test-first) ───

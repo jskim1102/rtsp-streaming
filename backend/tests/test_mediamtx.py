@@ -16,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 import app.mediamtx as mediamtx
 from app.database import Base
 from app.models import IpCam, _generate_stream_key, stream_key_prefix
+from app.stream_status import PathStatus, StreamStatusHub
 
 # autouse 패치 전 원본 _probe_codec — 실제 함수 단위테스트에서 mock subprocess 로 직접 호출.
 _REAL_PROBE = mediamtx._probe_codec
@@ -39,12 +40,6 @@ def test_remove_stream_raises_when_api_unset():
     with patch.object(mediamtx, "MEDIAMTX_API", ""):
         with pytest.raises(RuntimeError, match="MEDIAMTX_API"):
             mediamtx.remove_stream("ipcam-x")
-
-
-def test_get_path_raises_when_api_unset():
-    with patch.object(mediamtx, "MEDIAMTX_API", ""):
-        with pytest.raises(RuntimeError, match="MEDIAMTX_API"):
-            mediamtx.get_path("ipcam-x")
 
 
 # ─── remove_stream 끝상태 반환 (codex #4 — orphan 라이브 스트림 차단) ───
@@ -263,10 +258,14 @@ def _add_cam(sessions, stream_key: str, rtsp_url: str = "rtsp://cam/1") -> None:
         s.commit()
 
 
-def _run_cycles(sessions, listings: list) -> None:
-    """listings 순서대로 설정 목록을 돌려주며 주기를 돌린다 — None 은 조회 실패."""
-    reconciler = mediamtx.StreamReconciler()
-    with patch("app.mediamtx.list_config_paths", side_effect=listings):
+def _run_cycles(sessions, listings: list, hub=None, statuses=None) -> None:
+    """listings 순서대로 설정 목록을 돌려주며 주기를 돌린다 — None 은 조회 실패.
+
+    hub 를 주면 statuses(주기별 상태 목록, 기본은 모두 조회 실패)로 상태 확인도 돌린다.
+    """
+    reconciler = mediamtx.StreamReconciler(hub or StreamStatusHub())
+    with patch("app.mediamtx.list_config_paths", side_effect=listings), \
+         patch("app.mediamtx.list_path_status", side_effect=statuses or [None] * len(listings)):
         for _ in listings:
             with sessions() as db:
                 reconciler.run_once(db)
@@ -415,6 +414,90 @@ def test_sync_loop_survives_cycle_exception(caplog):
     assert len(calls) == 2
     assert factory.return_value.close.call_count == 2
     assert any("동기화 주기 실패" in r.getMessage() for r in caplog.records)
+
+
+# ─── 상태 확인 (훅 보정 — 동기화 주기의 첫 단계) ───
+
+
+def test_list_path_status_returns_module_paths_with_reader_ids(monkeypatch):
+    monkeypatch.delenv("MEDIAMTX_PATH_PREFIX", raising=False)
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"itemCount": 3, "pageCount": 1, "items": [
+        {"name": "all_others", "ready": False, "readers": []},
+        {"name": "other__ipcam-x", "ready": True, "readers": []},
+        {"name": "ipcam-a", "ready": True, "readers": [
+            {"type": "webRTCSession", "id": "r1"}, {"type": "rtspSession", "id": "r2"}]},
+    ]}
+    with patch.object(mediamtx, "MEDIAMTX_API", "http://mtx:9997"), \
+         patch("app.mediamtx.httpx.get", return_value=resp) as get:
+        assert mediamtx.list_path_status() == {"ipcam-a": PathStatus(True, {"r1", "r2"})}
+    assert get.call_args.args[0] == "http://mtx:9997/v3/paths/list"
+
+
+@pytest.mark.parametrize("failure", [MagicMock(status_code=401), mediamtx.httpx.ConnectError("down")])
+def test_list_path_status_returns_none_without_logging(failure, caplog):
+    with patch.object(mediamtx, "MEDIAMTX_API", "http://mtx:9997"), \
+         patch("app.mediamtx.httpx.get", side_effect=[failure]), \
+         caplog.at_level(logging.DEBUG, logger="rtsp-streaming"):
+        assert mediamtx.list_path_status() is None
+    assert caplog.records == []
+
+
+def test_reconcile_corrects_hub_from_mediamtx_status(sessions, mtx_calls):
+    """훅이 빠져도 주기마다 mediamtx 상태 목록으로 바로잡는다."""
+    _add_cam(sessions, "ipcam-a")
+    hub = StreamStatusHub()
+    hub.apply_hook("ready", "ipcam-a", None)  # notready 훅을 놓친 상태
+
+    _run_cycles(sessions, [{"ipcam-a"}], hub, [{"ipcam-a": PathStatus(False, set())}])
+
+    assert hub.snapshot() == {"ipcam-a": {"active": False, "readers": 0}}
+
+
+def test_reconcile_skips_only_status_check_when_status_list_fails(sessions, mtx_calls):
+    _add_cam(sessions, "ipcam-a")
+    hub = StreamStatusHub()
+    hub.apply_hook("ready", "ipcam-b", None)
+
+    _run_cycles(sessions, [set()], hub, [None])
+
+    assert hub.snapshot() == {"ipcam-b": {"active": True, "readers": 0}}
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1")
+
+
+def test_reconcile_marks_all_inactive_only_when_connection_drops(sessions, mtx_calls):
+    hub = StreamStatusHub()
+    hub.apply_hook("ready", "ipcam-a", None)
+    reconciler = mediamtx.StreamReconciler(hub)
+
+    with patch("app.mediamtx.list_config_paths", return_value=None), \
+         patch("app.mediamtx.list_path_status", return_value=None):
+        with sessions() as db:
+            reconciler.run_once(db)
+        assert hub.snapshot()["ipcam-a"]["active"] is False
+
+        # 설정 조회만 실패하고 훅은 계속 오는 경우 — 끊긴 동안 다시 끄지 않는다.
+        hub.apply_hook("ready", "ipcam-a", None)
+        with sessions() as db:
+            reconciler.run_once(db)
+
+    assert hub.snapshot()["ipcam-a"]["active"] is True
+
+
+def test_sync_loop_feeds_global_status_hub(sessions):
+    stop = threading.Event()
+    hub = StreamStatusHub()
+
+    def statuses():
+        stop.set()
+        return {"ipcam-a": PathStatus(True, set())}
+
+    with patch("app.stream_status.hub", hub), \
+         patch("app.mediamtx.list_path_status", side_effect=statuses), \
+         patch("app.mediamtx.list_config_paths", return_value=set()):
+        mediamtx.run_sync_loop(stop, sessions, interval=0)
+
+    assert hub.snapshot() == {"ipcam-a": {"active": True, "readers": 0}}
 
 
 # ─── 조건부 transcode: h264=passthrough(copy) / 그 외=libx264 (CEO #97 화질 정본) ───

@@ -7,6 +7,8 @@ PyYAML 이 이 빌드 의존성에 없어 docker-compose.yml 은 서비스 블�
 import re
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -56,6 +58,30 @@ def test_every_service_caps_container_log_size() -> None:
     assert 'max-file: "5"' in settings
     for name in ("backend", "frontend", "mediamtx"):
         assert "logging: *default-logging" in _service(name), f"{name} 서비스에 로그 상한이 없다"
+
+
+@pytest.mark.parametrize(("hook", "event"), [
+    ("runOnReady", "ready"), ("runOnNotReady", "notready"), ("runOnRead", "read"), ("runOnUnread", "unread"),
+])
+def test_mediamtx_hooks_notify_backend_of_path_status(hook: str, event: str) -> None:
+    """상태가 바뀌면 mediamtx 가 백엔드 훅 알림 API 를 부른다 — 화면 SSE 푸시의 출처다."""
+    config = (ROOT / "mediamtx.yml").read_text(encoding="utf-8")
+    defaults = config.split("\npathDefaults:\n", 1)[1].split("\npaths:", 1)[0]
+
+    command = (
+        "wget -q -T 3 -O /dev/null --post-data= "
+        f"http://backend:8000/internal/mediamtx/hook?event={event}&path=$MTX_PATH&reader=$MTX_READER_ID"
+    )
+    assert f"  {hook}: {command}\n" in defaults, f"pathDefaults 에 {hook} 훅이 없다"
+
+
+def test_backend_stops_within_graceful_shutdown_timeout() -> None:
+    """SSE 연결이 열려 있으면 uvicorn 이 종료·--reload 에서 멈춘다 — 8초 뒤 연결을 끊고 내려간다."""
+    dockerfile = (ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")
+    dev = (ROOT / "dev.sh").read_text(encoding="utf-8")
+
+    assert '"--timeout-graceful-shutdown", "8"' in dockerfile
+    assert "--timeout-graceful-shutdown 8" in dev
 
 
 def test_git_forces_lf_for_shell_scripts() -> None:

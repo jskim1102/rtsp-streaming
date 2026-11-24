@@ -212,7 +212,7 @@ select {
   margin-bottom: 20px;
 }
 
-/* 요약 스트립 — 전체/온라인 (phase4 stats polling 이 채움) */
+/* 요약 스트립 — 전체/온라인 (카메라 상태 SSE 가 채움) */
 .summary {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -267,7 +267,7 @@ select {
   white-space: nowrap;
 }
 
-/* 상태 표시 — phase4 stats.active 가 토글 */
+/* 상태 표시 — 카메라 상태 SSE 의 active 가 토글 */
 .status {
   font-size: 12px;
 }

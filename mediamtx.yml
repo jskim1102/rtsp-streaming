@@ -56,5 +56,14 @@ pprof: no
 pathDefaults:
   runOnDemandCloseAfter: 10s
   runOnDemandStartTimeout: 10s
+  # Status hooks notify the backend, which pushes changes to browsers over SSE.
+  # The backend also re-checks /v3/paths/list every 5 seconds, so a missed hook is corrected there.
+  # Commands run without a shell, so the unquoted & stays part of the URL.
+  # -T 3 keeps wget processes from piling up when the backend does not answer.
+  # backend:8000 resolves only inside compose; with dev.sh the hooks fail and the 5-second check takes over.
+  runOnReady: wget -q -T 3 -O /dev/null --post-data= http://backend:8000/internal/mediamtx/hook?event=ready&path=$MTX_PATH&reader=$MTX_READER_ID
+  runOnNotReady: wget -q -T 3 -O /dev/null --post-data= http://backend:8000/internal/mediamtx/hook?event=notready&path=$MTX_PATH&reader=$MTX_READER_ID
+  runOnRead: wget -q -T 3 -O /dev/null --post-data= http://backend:8000/internal/mediamtx/hook?event=read&path=$MTX_PATH&reader=$MTX_READER_ID
+  runOnUnread: wget -q -T 3 -O /dev/null --post-data= http://backend:8000/internal/mediamtx/hook?event=unread&path=$MTX_PATH&reader=$MTX_READER_ID
 
 paths: {}

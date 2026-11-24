@@ -61,30 +61,30 @@ export default function CamerasPage() {
       .catch(() => {});
   }, []);
 
-  // stats 1초 polling — 등록 카메라별 {active, readers} (mediamtx path 상태).
+  // 카메라 상태 SSE — 연결하면 snapshot 으로 전체를 받고, 그 뒤로 바뀐 카메라만 update 로 받는다.
+  // 끊겨도 따로 표시하지 않고 마지막 상태를 유지한다 — 네트워크 오류는 브라우저가 알아서 다시 연결한다.
+  // 200 이 아닌 응답 등으로 CLOSED 가 되면 브라우저가 다시 연결하지 않아 3초 뒤 새로 연다.
   useEffect(() => {
-    let cancelled = false;
-    async function poll() {
-      const entries = await Promise.all(
-        cams.map(async (c) => {
-          try {
-            const resp = await fetch(`${apiBase()}/api/ipcams/${c.stream_key}/stats`);
-            if (!resp.ok) return [c.stream_key, { active: false, readers: 0 }] as const;
-            return [c.stream_key, (await resp.json()) as Stat] as const;
-          } catch {
-            return [c.stream_key, { active: false, readers: 0 }] as const;
-          }
-        })
-      );
-      if (!cancelled) setStats(Object.fromEntries(entries));
+    let source: EventSource;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    function open() {
+      source = new EventSource(`${apiBase()}/api/ipcams/events`);
+      source.addEventListener("snapshot", (e) => setStats(JSON.parse(e.data)));
+      source.addEventListener("update", (e) => {
+        // 목록에 없는 카메라의 키는 저장만 되고 화면에는 나오지 않는다.
+        const { stream_key, ...stat } = JSON.parse(e.data) as Stat & { stream_key: string };
+        setStats((prev) => ({ ...prev, [stream_key]: stat }));
+      });
+      source.onerror = () => {
+        if (source.readyState === EventSource.CLOSED) retry = setTimeout(open, 3000);
+      };
     }
-    poll();
-    const timer = setInterval(poll, 1000);
+    open();
     return () => {
-      cancelled = true;
-      clearInterval(timer);
+      clearTimeout(retry);
+      source.close();
     };
-  }, [cams]);
+  }, []);
 
   const online = cams.filter((c) => stats[c.stream_key]?.active).length;
   const atCap = cams.length >= maxIpcams;

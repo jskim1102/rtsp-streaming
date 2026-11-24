@@ -1,15 +1,18 @@
 import logging
+from collections.abc import AsyncIterator
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.sse import EventSourceResponse, ServerSentEvent
 from pydantic import BaseModel, field_serializer
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app import stream_status
 from app.config import MAX_IPCAMS
 from app.database import get_db
 from app.masking import _MASK, _restore_masked_password, _split_credentials, mask_rtsp_credentials
-from app.mediamtx import get_path, register_stream, remove_stream, update_stream
+from app.mediamtx import list_path_status, register_stream, remove_stream, update_stream
 from app.mediamtx import _validate_rtsp_url
 from app.models import IpCam
 
@@ -246,17 +249,14 @@ def delete_ipcam(cam_id: int, db: Session = Depends(get_db)) -> None:
     logger.info("IP CAM 삭제: id=%d stream_key=%s", cam_id, stream_key)
 
 
-@router.get("/{stream_key}/stats")
-def get_ipcam_stats(stream_key: str) -> dict:
-    """IP CAM path 활성/시청자수 (mediamtx /v3/paths/get 기반).
+@router.get("/events", response_class=EventSourceResponse)
+async def stream_ipcam_events() -> AsyncIterator[ServerSentEvent]:
+    """카메라 상태 SSE — 화면이 카메라별 stats 를 1초마다 폴링하던 것을 대체한다.
 
-    - active: mediamtx path 가 ready (source 연결됨)
-    - readers: 현재 WHEP 시청자 수
-    path 가 없거나 ready 아니면 `{active: false, readers: 0}`.
-
-    조회만 한다 — 빠진 path 재등록은 백그라운드 동기화(mediamtx.run_sync_loop)가 맡는다.
+    - 연결하면 `snapshot`(전체 `{stream_key: {active, readers}}`)을 먼저 보낸다.
+    - 그 뒤로는 값이 바뀐 카메라만 `update`(`{stream_key, active, readers}`)로 보낸다.
+    - 상태는 mediamtx 훅이 바로 바꾸고, 백그라운드 동기화가 5초마다 바로잡는다.
+    - keep-alive 주석은 FastAPI 기본값(15초)으로 보낸다.
     """
-    path = get_path(stream_key)
-    if not path or not path.get("ready"):
-        return {"active": False, "readers": 0}
-    return {"active": True, "readers": len(path.get("readers", []))}
+    async for event in stream_status.hub.subscribe(list_path_status):
+        yield event

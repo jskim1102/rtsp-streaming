@@ -12,9 +12,11 @@ from collections.abc import Callable
 import httpx
 from sqlalchemy.orm import Session
 
+from app import stream_status
 from app.config import MEDIAMTX_API, MEDIAMTX_BACKEND_PASS, MEDIAMTX_BACKEND_USER
 from app.masking import mask_rtsp_credentials
 from app.models import IpCam, stream_key_prefix
+from app.stream_status import PathStatus, StreamStatusHub
 
 logger = logging.getLogger("rtsp-streaming.mediamtx")
 
@@ -220,21 +222,51 @@ def list_config_paths() -> set[str] | None:
     return {item["name"] for item in resp.json()["items"]}
 
 
-class StreamReconciler:
-    """DB 카메라 목록에 mediamtx path 를 맞춘다 — 상태 조회 요청과 분리된 백그라운드 동기화.
+def list_path_status() -> dict[str, PathStatus] | None:
+    """mediamtx path 상태 목록 (`GET /v3/paths/list`) — 이 모듈 형식의 path 만 고른다.
 
+    - 성공: `{stream_key: PathStatus(ready, 시청 세션 ID 집합)}`. 시청 세션 ID 는 훅의 MTX_READER_ID 와 같다.
+    - 실패(연결 실패·200 아님): None. 설정 목록과 같은 이유로 로그를 남기지 않는다.
+    - 설정 목록과 같은 이유로 기본 페이지(100개) 하나에 다 들어온다.
+    """
+    _require_api()
+    try:
+        resp = httpx.get(f"{MEDIAMTX_API}/v3/paths/list", auth=_auth(), timeout=5)
+    except httpx.HTTPError:
+        return None
+    if resp.status_code != 200:
+        return None
+    prefix = stream_key_prefix()
+    return {
+        item["name"]: PathStatus(item["ready"], {reader["id"] for reader in item["readers"]})
+        for item in resp.json()["items"]
+        if item["name"].startswith(prefix)
+    }
+
+
+class StreamReconciler:
+    """DB 카메라 목록에 mediamtx path 를 맞추고 상태를 보정한다 — 요청 처리와 분리된 백그라운드 동기화.
+
+    - 상태 확인: mediamtx 상태 목록으로 상태 저장소(hub)를 바로잡는다. 훅이 빠지거나 순서가 뒤바뀐 경우의 보정이다.
     - 빠진 path(DB 에만 있음): 재등록한다. mediamtx 가 재시작되면 동적 등록한 path 가 사라진다.
     - 남은 path(mediamtx 에만 있음): 이 모듈 형식만, 두 주기 연속 보이면 지운다.
     - mediamtx 조회 실패: 그 주기를 건너뛴다. 실패를 '경로 없음'으로 보면 재등록이 폭주한다.
     - 주기 사이에 남은 path 후보와 직전 연결 상태를 기억하므로 인스턴스 하나를 계속 쓴다.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hub: StreamStatusHub) -> None:
+        self._hub = hub
         self._orphan_candidates: set[str] = set()  # 직전 주기에 처음 본 남은 path
         self._connected: bool | None = None  # None = 첫 조회 전 (첫 성공은 '다시 연결됨'으로 보지 않음)
 
     def run_once(self, db: Session) -> None:
-        """동기화 한 주기 — DB 읽기 → mediamtx 목록 조회 → 빠진 path 재등록 → 남은 path 정리."""
+        """동기화 한 주기 — 상태 확인 → DB 읽기 → mediamtx 목록 조회 → 빠진 path 재등록 → 남은 path 정리."""
+        # 상태 확인을 맨 앞에 둔다 — 대량 재등록으로 주기가 길어져도 주기마다 먼저 보정한다.
+        # 상태 목록 조회만 실패하면 이 단계만 건너뛴다 — 끊김 판단은 아래 설정 목록 기준이다.
+        statuses = list_path_status()
+        if statuses is not None:
+            self._hub.replace_all(statuses)
+
         # DB 를 먼저 읽는다 — 등록 API 는 mediamtx 등록 뒤에 DB 를 커밋한다.
         # 커밋 전 카메라는 여기 안 보이므로, 등록 중인 path 를 빠졌다고 보고 중복 등록하지 않는다.
         cams = dict(db.query(IpCam.stream_key, IpCam.rtsp_url).all())
@@ -245,6 +277,9 @@ class StreamReconciler:
         if paths is None:
             if self._connected is not False:
                 logger.warning("mediamtx 연결 끊김 — 동기화를 건너뛴다")
+                # 끊긴 순간 한 번만 화면을 모두 꺼짐으로 바꾼다.
+                # 끊긴 동안 훅이 오면(설정 조회만 실패하는 경우) 그 값을 덮어쓰지 않는다.
+                self._hub.mark_all_inactive()
             self._connected = False
             return
         if self._connected is False:
@@ -291,7 +326,7 @@ def run_sync_loop(
     - 주기마다 세션을 새로 열고 닫는다 — 오래 연 세션이 커넥션을 붙잡지 않게.
     - session_factory·interval 을 받아 테스트가 가짜 세션·0초 대기로 돌릴 수 있다.
     """
-    reconciler = StreamReconciler()
+    reconciler = StreamReconciler(stream_status.hub)
     while not stop.is_set():
         db = session_factory()
         try:
@@ -303,19 +338,3 @@ def run_sync_loop(
             db.close()
         # 종료 신호가 오면 대기 중에도 바로 깨어난다.
         stop.wait(interval)
-
-
-def get_path(stream_key: str) -> dict | None:
-    """mediamtx path 상태 조회 (/v3/paths/get/<path>).
-
-    반환은 mediamtx 응답 dict (`ready`, `readers` 등) 또는 path 없으면 None.
-    """
-    _require_api()
-    try:
-        resp = httpx.get(f"{MEDIAMTX_API}/v3/paths/get/{stream_key}", auth=_auth(), timeout=5)
-        if resp.status_code == 200:
-            return resp.json()
-        return None
-    except httpx.HTTPError:
-        logger.exception("mediamtx path 조회 실패: %s", stream_key)
-        return None
