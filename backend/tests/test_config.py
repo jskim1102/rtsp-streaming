@@ -1,7 +1,8 @@
 """config.py 빈 env 안전 기본값 — 빈 문자열(set-but-empty)=미설정으로 폴백 (codex #3).
 
 버그: 빈 문자열을 진짜값으로 취급해 MAX_IPCAMS="" → int("") → ValueError(import 크래시),
-CORS_ORIGINS="" → main.py 에서 [""] (기본 * 아님 → 프론트 CORS 차단). 고침: 빈값=미설정.
+CORS_ORIGINS="" → main.py 에서 [""] (뜻 없는 출처 하나). 고침: 빈값=미설정.
+CORS 기본값은 리버스 프록시(체크리스트 1번) 뒤로 같은 출처가 되면서 * 에서 빈 목록(다른 출처 허용 안 함)으로 바뀌었다.
 config 는 import 시점에 env 를 읽으므로, env 를 세팅하고 importlib.reload 로 재평가해 검증한다.
 """
 
@@ -32,16 +33,18 @@ def test_empty_max_ipcams_falls_back_to_16(monkeypatch):
     assert config.MAX_IPCAMS == 16
 
 
-def test_empty_cors_origins_falls_back_to_star(monkeypatch):
+def test_empty_cors_origins_means_no_cross_origin(monkeypatch):
+    """화면과 API 가 같은 출처(프록시)라 기본으로 다른 출처를 열지 않는다 (R-13)."""
     config = _reload_config(monkeypatch, CORS_ORIGINS="")
-    assert config.CORS_ORIGINS == "*"
+    assert config.CORS_ORIGINS == ""
+    assert config.cors_origin_list(config.CORS_ORIGINS) == []
 
 
 def test_both_empty_imports_without_crash(monkeypatch):
     """둘 다 빈값이어도 import(=reload) 가 ValueError 없이 통과 + 안전기본 적용."""
     config = _reload_config(monkeypatch, MAX_IPCAMS="", CORS_ORIGINS="")
     assert config.MAX_IPCAMS == 16
-    assert config.CORS_ORIGINS == "*"
+    assert config.CORS_ORIGINS == ""
 
 
 def test_set_values_are_respected(monkeypatch):
@@ -49,3 +52,14 @@ def test_set_values_are_respected(monkeypatch):
     config = _reload_config(monkeypatch, MAX_IPCAMS="32", CORS_ORIGINS="http://example.com:5177")
     assert config.MAX_IPCAMS == 32
     assert config.CORS_ORIGINS == "http://example.com:5177"
+
+
+@pytest.mark.parametrize(("raw", "expected"), [
+    ("", []),  # codex #3: 빈 값이 [""] 가 되지 않는다
+    ("*", ["*"]),
+    ("http://a:1, ,http://b:2 ", ["http://a:1", "http://b:2"]),
+])
+def test_cors_origin_list_parses_comma_separated_origins(raw, expected):
+    import app.config
+
+    assert app.config.cors_origin_list(raw) == expected

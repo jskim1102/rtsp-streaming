@@ -5,7 +5,7 @@
 #
 # 환경변수: 같은 디렉토리의 `.env` 를 compose 가 자동으로 읽어 ${VAR} 로 치환.
 #          setup이 .env.example로 .env를 생성한다.
-# 브라우저 접속: http://<서버IP>:${FRONTEND_PORT}  (frontend)
+# 브라우저 접속: https://<서버IP>:${FRONTEND_PORT}  (frontend 프록시가 화면·API·영상 신호의 단일 입구)
 
 name: rtsp-streaming
 
@@ -36,8 +36,8 @@ services:
       # mediamtx 인증 — backend user. 경로 등록·조회 API 만 쓴다.
       MEDIAMTX_BACKEND_USER: ${MEDIAMTX_BACKEND_USER:-backend}
       MEDIAMTX_BACKEND_PASS: ${MEDIAMTX_BACKEND_PASS:?set MEDIAMTX_BACKEND_PASS in .env}
-    ports:
-      - "${BACKEND_PORT:?set BACKEND_PORT in .env}:8000"
+    # 포트를 호스트에 공개하지 않는다 — frontend 프록시가 /api 만 넘기고, 훅 알림 주소(/internal)는 밖에서 닿지 않는다.
+    # BACKEND_PORT 는 dev.sh 가 호스트에서 백엔드를 띄울 때만 쓴다.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
       interval: 5s
@@ -56,28 +56,33 @@ services:
 
   # ─────────────────────────────── Frontend ──────────────────────────────
   frontend:
+    # 빌드에는 포트·자격증명을 넣지 않는다 — 넣은 값은 화면 번들에 그대로 남는다 (아래 environment 로 실행 때 받음).
     build:
       context: ./frontend
-      args:
-        # Vite 는 빌드 타임에 VITE_* 를 정적 인라인하므로 build.args 로 전달.
-        # 브라우저가 접속할 포트이므로 "호스트에 노출된" 포트 값을 넘긴다.
-        VITE_API_PORT: "${BACKEND_PORT}"
-        # WHEP 접속 포트 (mediamtx webrtc, 호스트 노출 포트).
-        VITE_MEDIAMTX_WEBRTC_PORT: "${MEDIAMTX_WEBRTC_PORT:?set MEDIAMTX_WEBRTC_PORT in .env}"
-        # WHEP 인증 — 브라우저가 viewer 자격증명으로 mediamtx read (빌드타임 인라인).
-        VITE_MEDIAMTX_VIEWER_USER: "${MEDIAMTX_VIEWER_USER:-viewer_rtsp_streaming}"
-        VITE_MEDIAMTX_VIEWER_PASS: "${MEDIAMTX_VIEWER_PASS:?set MEDIAMTX_VIEWER_PASS in .env}"
     image: rtsp-streaming-frontend:dev
     pull_policy: build
     container_name: rtsp-streaming-frontend
+    environment:
+      # 프록시가 실행할 때 읽는 값 — 이미지와 화면 번들에는 넣지 않는다.
+      # WHEP 경로 규칙(<접두사>__ipcam-)과 viewer 자격증명(프록시가 WHEP 요청에 붙임)에 쓴다.
+      MEDIAMTX_PATH_PREFIX: ${MEDIAMTX_PATH_PREFIX:-rtsp_streaming}
+      MEDIAMTX_VIEWER_USER: ${MEDIAMTX_VIEWER_USER:-viewer_rtsp_streaming}
+      MEDIAMTX_VIEWER_PASS: ${MEDIAMTX_VIEWER_PASS:?set MEDIAMTX_VIEWER_PASS in .env}
+      # 자체 서명 인증서에 넣을 주소. 비우면 localhost·127.0.0.1 만 넣는다.
+      MEDIAMTX_WEBRTC_HOST: ${MEDIAMTX_WEBRTC_HOST:-}
     ports:
-      # 호스트 ${FRONTEND_PORT} → 컨테이너 80 (Nginx 기본 포트, 이미지 빌드시 고정)
-      - "${FRONTEND_PORT:?set FRONTEND_PORT in .env}:80"
+      # 호스트 ${FRONTEND_PORT} → 컨테이너 443 (HTTPS + HTTP/2). 같은 포트로 온 http:// 는 https:// 로 넘긴다.
+      - "${FRONTEND_PORT:?set FRONTEND_PORT in .env}:443"
+    volumes:
+      # 인증서 폴더 — 운영자 인증서(server.crt·server.key)를 넣거나, 없으면 자체 서명 인증서가 여기 남아 업데이트 뒤에도 유지된다.
+      - ./certs:/etc/nginx/certs
+    networks:
+      - rtsp-streaming
     depends_on:
       backend:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      test: ["CMD", "curl", "-fsk", "-o", "/dev/null", "https://127.0.0.1/"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -107,7 +112,8 @@ services:
       # API 는 backend control plane 용이라 host loopback 에만 노출한다.
       - "127.0.0.1:${MEDIAMTX_API_PORT:?set MEDIAMTX_API_PORT in .env}:9997"
       - "${MEDIAMTX_RTSP_PORT:?set MEDIAMTX_RTSP_PORT in .env}:8554"
-      - "${MEDIAMTX_WEBRTC_PORT:?set MEDIAMTX_WEBRTC_PORT in .env}:8889/tcp"
+      # WebRTC 신호(WHEP)는 frontend 프록시가 내부망으로 넘긴다 — 호스트에는 이 PC 에만 연다 (dev.sh 의 개발 서버용).
+      - "127.0.0.1:${MEDIAMTX_WEBRTC_PORT:?set MEDIAMTX_WEBRTC_PORT in .env}:8889/tcp"
       - "${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}:${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}/udp"
       - "${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}:${MEDIAMTX_ICE_UDP_PORT:?set MEDIAMTX_ICE_UDP_PORT in .env}/tcp"
     volumes:

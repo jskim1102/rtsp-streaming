@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { apiBase } from "../hooks/useApi";
 import CameraFormModal from "../components/CameraFormModal";
 import CameraGrid from "../components/CameraGrid";
 
@@ -44,7 +43,7 @@ export default function CamerasPage() {
 
   // 목록을 다시 받아 화면에 반영하고, 받은 목록을 돌려준다(수정 충돌 때 최신 값을 찾는 데 쓴다).
   const fetchCams = useCallback(async (): Promise<Cam[] | null> => {
-    const resp = await fetch(`${apiBase()}/api/ipcams`);
+    const resp = await fetch(`/api/ipcams`);
     if (!resp.ok) return null;
     const list: Cam[] = await resp.json();
     setCams(list);
@@ -57,7 +56,7 @@ export default function CamerasPage() {
 
   // 등록 cap 을 백엔드에서 1회 로딩 (없으면 fallback 유지).
   useEffect(() => {
-    fetch(`${apiBase()}/api/config`)
+    fetch(`/api/config`)
       .then((r) => (r.ok ? r.json() : null))
       .then((cfg) => {
         if (cfg?.max_ipcams) setMaxIpcams(cfg.max_ipcams);
@@ -72,7 +71,7 @@ export default function CamerasPage() {
     let source: EventSource;
     let retry: ReturnType<typeof setTimeout> | undefined;
     function open() {
-      source = new EventSource(`${apiBase()}/api/ipcams/events`);
+      source = new EventSource(`/api/ipcams/events`);
       source.addEventListener("snapshot", (e) => setStats(JSON.parse(e.data)));
       source.addEventListener("update", (e) => {
         // 목록에 없는 카메라의 키는 저장만 되고 화면에는 나오지 않는다.
@@ -103,7 +102,7 @@ export default function CamerasPage() {
       // 사용자가 입력한 url 이 기존값(마스킹 :***@ 포함)과 다르면 스트림 변경(비번·주소 등).
       // 이름만 바꾼 편집은 여기서 false → remount 하지 않는다(불필요한 WHEP 재연결/깜빡임 방지).
       const urlChanged = rtspUrl !== editCam.rtsp_url;
-      const resp = await fetch(`${apiBase()}/api/ipcams/${editCam.id}`, {
+      const resp = await fetch(`/api/ipcams/${editCam.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, rtsp_url: rtspUrl, version: editCam.version }),
@@ -128,7 +127,7 @@ export default function CamerasPage() {
         setPlayerEpoch((prev) => ({ ...prev, [id]: (prev[id] ?? 0) + 1 }));
       }
     } else {
-      const resp = await fetch(`${apiBase()}/api/ipcams`, {
+      const resp = await fetch(`/api/ipcams`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, rtsp_url: rtspUrl }),
@@ -145,7 +144,7 @@ export default function CamerasPage() {
 
   async function deleteCam(cam: Cam) {
     if (!window.confirm(`${cam.name} 삭제?`)) return;
-    const resp = await fetch(`${apiBase()}/api/ipcams/${cam.id}`, { method: "DELETE" });
+    const resp = await fetch(`/api/ipcams/${cam.id}`, { method: "DELETE" });
     if (!resp.ok) {
       // 백엔드 detail(예: 다른 작업 진행 중 409)을 그대로 노출 — PUT 경로와 일관.
       setError(await errorDetail(resp, "카메라 삭제에 실패했습니다."));

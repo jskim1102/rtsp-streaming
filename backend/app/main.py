@@ -5,7 +5,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import CORS_ORIGINS, MAX_IPCAMS, logger
+from app.config import CORS_ORIGINS, MAX_IPCAMS, cors_origin_list, logger
 from app.database import SessionLocal, init_db
 from app.ipcam import router as ipcam_router
 from app.mediamtx import run_sync_loop
@@ -35,11 +35,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="RTSP Streaming API", lifespan=lifespan)
 
-# CORS
-cors_origins = ["*"] if CORS_ORIGINS == "*" else [o.strip() for o in CORS_ORIGINS.split(",")]
+# CORS — 기본은 다른 출처를 허용하지 않는다 (같은 출처 프록시). CORS_ORIGINS 로 열 수 있다.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins,
+    allow_origins=cors_origin_list(CORS_ORIGINS),
     allow_methods=["*"],
     allow_headers=["*"],
 )

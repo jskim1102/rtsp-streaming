@@ -138,4 +138,4 @@ if ! docker compose up -d --no-build --pull never --wait --wait-timeout 900; the
   die "서비스 시작에 실패했어요. docker compose logs 로 원인을 확인하세요."
 fi
 
-printf '\n설치 완료 — 브라우저에서 http://localhost:%s 에 접속하세요.\n' "$(env_get FRONTEND_PORT)"
+printf '\n설치 완료 — 브라우저에서 https://localhost:%s 에 접속하세요.\n' "$(env_get FRONTEND_PORT)"
