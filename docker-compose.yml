@@ -101,8 +101,8 @@ services:
       MTX_AUTHINTERNALUSERS_2_USER: ${MEDIAMTX_VIEWER_USER:-viewer_rtsp_streaming}
       MTX_AUTHINTERNALUSERS_2_PASS: ${MEDIAMTX_VIEWER_PASS:?set MEDIAMTX_VIEWER_PASS in .env}
       # path prefix override 도 viewer 권한 경계에 함께 반영한다.
+      # viewer 권한 칸(mediamtx.yml)이 read 하나라 0번만 덮어쓴다 — 없는 칸을 가리키면 빈 권한 칸이 생긴다.
       MTX_AUTHINTERNALUSERS_2_PERMISSIONS_0_PATH: "~^${MEDIAMTX_PATH_PREFIX:-rtsp_streaming}__"
-      MTX_AUTHINTERNALUSERS_2_PERMISSIONS_1_PATH: "~^${MEDIAMTX_PATH_PREFIX:-rtsp_streaming}__"
     ports:
       # API 는 backend control plane 용이라 host loopback 에만 노출한다.
       - "127.0.0.1:${MEDIAMTX_API_PORT:?set MEDIAMTX_API_PORT in .env}:9997"

@@ -84,6 +84,28 @@ def test_backend_stops_within_graceful_shutdown_timeout() -> None:
     assert "--timeout-graceful-shutdown 8" in dev
 
 
+def _mediamtx_permissions() -> list[list[str]]:
+    """mediamtx.yml authInternalUsers 의 계정별 action 목록 — 순서대로 [0] 로컬, [1] backend, [2] viewer."""
+    config = (ROOT / "mediamtx.yml").read_text(encoding="utf-8")
+    block = config.split("\nauthInternalUsers:\n", 1)[1].split("\n\n", 1)[0]
+    return [re.findall(r"- action: (\w+)", user) for user in block.split("\n  - user:")[1:]]
+
+
+def test_mediamtx_accounts_keep_only_permissions_in_use() -> None:
+    """쓰지 않는 권한은 두지 않는다 — 계정이 새도 할 수 있는 일을 줄인다.
+
+    로컬 ffmpeg 는 송출만, backend 는 경로 등록 API 만, viewer 는 시청만 한다. 재생(playback) 서버는 꺼져 있다.
+    """
+    assert _mediamtx_permissions() == [["publish"], ["api"], ["read"]]
+
+
+def test_compose_overrides_only_existing_viewer_permission_paths() -> None:
+    """없는 권한 칸을 가리키면 mediamtx 가 action 이 빈 칸을 하나 더 만든다 (1.19.1 확인) — 칸 수만큼만 덮어쓴다."""
+    indexes = re.findall(r"MTX_AUTHINTERNALUSERS_2_PERMISSIONS_(\d+)_PATH", _service("mediamtx"))
+
+    assert indexes == [str(i) for i in range(len(_mediamtx_permissions()[2]))]
+
+
 def test_git_forces_lf_for_shell_scripts() -> None:
     attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
 

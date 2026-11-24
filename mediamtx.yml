@@ -5,30 +5,25 @@
 logLevel: error
 logDestinations: [stdout]
 
+# Each account keeps only the permissions it uses, so a leaked password can do less.
+# The playback server is disabled (playback: no), so no account has the playback action.
 authInternalUsers:
-  # [0] Local runOnDemand ffmpeg publish/republish only.
+  # [0] Local runOnDemand ffmpeg publishes the transcoded stream. Nothing local reads it.
   - user: any
     pass:
     ips: ['127.0.0.1', '::1']
     permissions:
       - action: publish
-      - action: read
-      - action: playback
-  # [1] Backend control plane and stream management.
+  # [1] Backend control plane: path add/patch/delete and status through the API only.
   - user: backend
     pass: changeme          # MTX_AUTHINTERNALUSERS_1_PASS
     permissions:
       - action: api
-      - action: publish
-      - action: read
-      - action: playback
-  # [2] Browser viewer, restricted to this module's path prefix.
+  # [2] Browser viewer (WebRTC) and RTSP re-streaming, restricted to this module's path prefix.
   - user: viewer_rtsp_streaming
     pass: changeme          # MTX_AUTHINTERNALUSERS_2_PASS
     permissions:
       - action: read
-        path: ~^rtsp_streaming__
-      - action: playback
         path: ~^rtsp_streaming__
 
 api: yes
