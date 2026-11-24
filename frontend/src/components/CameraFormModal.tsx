@@ -59,6 +59,7 @@ export default function CameraFormModal({ open, editCam, onClose, onSave }: Prop
             value={name}
             onChange={(e) => setName(e.target.value)}
             placeholder="예: 정문 입구 카메라"
+            maxLength={100} // 백엔드 상한(DB 컬럼 길이)과 같다
           />
         </div>
 
@@ -68,6 +69,7 @@ export default function CameraFormModal({ open, editCam, onClose, onSave }: Prop
             value={rtspUrl}
             onChange={(e) => setRtspUrl(e.target.value)}
             placeholder="rtsp://192.168.0.100:554/stream1"
+            maxLength={500} // 백엔드 상한(DB 컬럼 길이)과 같다
           />
           <p className="hint">
             형식 — rtsp://[user:pass@]IP:PORT/PATH · 지원 코덱 H.264 / H.265

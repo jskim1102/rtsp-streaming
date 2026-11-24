@@ -302,6 +302,78 @@ def test_returns_409_while_same_camera_is_busy(client, mtx, method):
     assert client.get("/api/ipcams").json()[0]["name"] == "b"
 
 
+# ─── 입력 길이·공백 검사 ───
+
+
+def test_create_accepts_name_up_to_100_chars(client):
+    resp = client.post("/api/ipcams", json={"name": "가" * 100, "rtsp_url": "rtsp://x/1"})
+
+    assert resp.status_code == 201
+
+
+@pytest.mark.parametrize("name", ["가" * 101, "", "   "])
+def test_create_rejects_empty_or_too_long_name(client, mtx, name):
+    resp = client.post("/api/ipcams", json={"name": name, "rtsp_url": "rtsp://x/1"})
+
+    assert resp.status_code == 400
+    assert "1~100자" in resp.json()["detail"]
+    mtx["register"].assert_not_called()
+    assert client.get("/api/ipcams").json() == []
+
+
+def test_create_rejects_url_over_500_chars(client, mtx):
+    url = "rtsp://x/" + "a" * 492  # 501자
+
+    resp = client.post("/api/ipcams", json={"name": "c", "rtsp_url": url})
+
+    assert resp.status_code == 400
+    assert "500자" in resp.json()["detail"]
+    mtx["register"].assert_not_called()
+
+
+def test_create_strips_surrounding_whitespace(client, mtx):
+    """앞뒤 공백을 지운 값으로 검사·저장한다 — 화면과 같은 규칙. 주소 앞뒤 공백도 금지문자로 걸리지 않는다."""
+    resp = client.post("/api/ipcams", json={"name": "  정문  ", "rtsp_url": "  rtsp://x/1  "})
+
+    assert resp.status_code == 201
+    assert (resp.json()["name"], resp.json()["rtsp_url"]) == ("정문", "rtsp://x/1")
+    mtx["register"].assert_called_once_with(resp.json()["stream_key"], "rtsp://x/1", "h264")
+
+
+@pytest.mark.parametrize(("name", "url", "message"), [
+    ("가" * 101, "rtsp://x/old", "1~100자"),
+    ("   ", "rtsp://x/old", "1~100자"),
+    ("u", "rtsp://x/" + "a" * 492, "500자"),
+])
+def test_update_rejects_invalid_input_without_touching_mediamtx(client, mtx, name, url, message):
+    cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
+    mtx["update"].reset_mock()
+
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": name, "rtsp_url": url, "version": 1})
+
+    assert resp.status_code == 400
+    assert message in resp.json()["detail"]
+    mtx["update"].assert_not_called()
+    assert client.get("/api/ipcams").json()[0]["version"] == 1
+
+
+def test_update_checks_url_length_after_restoring_masked_password(client, mtx):
+    """*** 를 실제 비밀번호로 되돌린 뒤의 길이로 검사한다 — 검사 도입 전에 저장된 긴 주소도 수정 때 걸린다."""
+    cam = client.post("/api/ipcams", json={"name": "c", "rtsp_url": "rtsp://admin:pw@10.0.0.5/s"}).json()
+    long_url = "rtsp://admin:" + "p" * 480 + "@10.0.0.5/s"  # 501자 이상 — 검사 도입 전 저장된 값
+    with closing(sqlite3.connect(client.db_path)) as con:
+        con.execute("UPDATE ip_cams SET rtsp_url = ? WHERE id = ?", (long_url, cam["id"]))
+        con.commit()
+    masked = client.get("/api/ipcams").json()[0]["rtsp_url"]  # rtsp://admin:***@10.0.0.5/s — 짧다
+    mtx["update"].reset_mock()
+
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": masked, "version": 1})
+
+    assert resp.status_code == 400
+    assert "500자" in resp.json()["detail"]
+    mtx["update"].assert_not_called()
+
+
 # ─── 낙관적 락 (같은 카메라 동시 수정) ───
 
 

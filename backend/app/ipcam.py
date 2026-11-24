@@ -40,6 +40,26 @@ def _camera_lock_or_409(stream_key: str) -> Iterator[None]:
         lock.release()
 
 
+# 입력 길이 상한 — DB 컬럼 길이(models.py 의 String(100)·String(500))를 그대로 쓴다.
+# SQLite 는 컬럼 길이를 강제하지 않아 API 가 막는다. 화면 입력란의 maxLength 도 같은 값이다.
+_NAME_MAX = IpCam.name.type.length
+_URL_MAX = IpCam.rtsp_url.type.length
+
+
+def _clean_name(name: str) -> str:
+    """앞뒤 공백을 지운 이름을 돌려준다 — 비었거나 길면 400 (화면과 같은 규칙)."""
+    name = name.strip()
+    if not 1 <= len(name) <= _NAME_MAX:
+        raise HTTPException(status_code=400, detail=f"카메라 이름은 1~{_NAME_MAX}자로 입력하세요")
+    return name
+
+
+def _check_url_length(rtsp_url: str) -> None:
+    """주소 길이 검사 — 길면 400. 빈 주소는 _check_rtsp_url 의 스킴 검사가 막는다."""
+    if len(rtsp_url) > _URL_MAX:
+        raise HTTPException(status_code=400, detail=f"RTSP 주소는 {_URL_MAX}자 이하로 입력하세요")
+
+
 def _check_rtsp_url(rtsp_url: str) -> None:
     """rtsp_url 검증 — 위험하면 400 (DB 쓰기 전에 막아 오염·500 방지)."""
     try:
@@ -161,7 +181,11 @@ def create_ipcam(body: IpCamCreate, db: Session = Depends(get_db)) -> IpCam:
     - 등록이 실패하면 저장한 행을 지우고 503 — "성공처럼 보이는 실패" 방지(P1-3).
     - 커밋 전부터 카메라 잠금을 잡는다 — 커밋~등록 사이에 동기화가 '빠진 path'로 보고 먼저 등록하지 않게.
     """
-    _check_rtsp_url(body.rtsp_url)
+    # 입력 검사는 DB·mediamtx 를 건드리기 전에 한다. 앞뒤 공백을 지운 값으로 검사하고 저장한다.
+    name = _clean_name(body.name)
+    rtsp_url = body.rtsp_url.strip()
+    _check_url_length(rtsp_url)
+    _check_rtsp_url(rtsp_url)
     # 잠금을 커밋 전에 잡으려고 stream_key 를 미리 만든다. 새 키라 잠금이 겹치는 일은 없다.
     stream_key = _generate_stream_key()
     with _camera_lock_or_409(stream_key):
@@ -177,7 +201,7 @@ def create_ipcam(body: IpCamCreate, db: Session = Depends(get_db)) -> IpCam:
                 status_code=409,
                 detail=f"최대 {MAX_IPCAMS}대까지 등록할 수 있습니다",
             )
-        cam = IpCam(name=body.name, rtsp_url=body.rtsp_url, stream_key=stream_key)
+        cam = IpCam(name=name, rtsp_url=rtsp_url, stream_key=stream_key)
         db.add(cam)
         # 여기서 쓰기 락이 풀린다 — 아래 판별·mediamtx 등록은 락 없이 한다.
         db.commit()
@@ -185,8 +209,8 @@ def create_ipcam(body: IpCamCreate, db: Session = Depends(get_db)) -> IpCam:
         # 코덱은 여기서 한 번만 판별해 등록에 쓰고 저장한다 — 재등록 때는 저장값을 쓴다.
         registered = False
         try:
-            codec = _probe_codec(body.rtsp_url)
-            registered = _register_or_fail(stream_key, body.rtsp_url, codec)
+            codec = _probe_codec(rtsp_url)
+            registered = _register_or_fail(stream_key, rtsp_url, codec)
         finally:
             if not registered:
                 # 이미 커밋했으므로 롤백 대신 행을 지운다 — 등록 실패(False)든 예외든 행을 남기지 않는다.
@@ -235,6 +259,9 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
     - mediamtx 를 먼저 바꾸는 이유: ffprobe·요청 동안 쓰기 락을 잡지 않기 위해서다.
     - 저장이 실패하면 mediamtx 를 이전 주소로 되돌리고 503.
     """
+    # 입력 검사는 DB·mediamtx 를 건드리기 전에 한다. 앞뒤 공백을 지운 값으로 검사하고 저장한다.
+    name = _clean_name(body.name)
+    raw_url = body.rtsp_url.strip()
     stream_key = _find_stream_key(db, cam_id)
     with _camera_lock_or_409(stream_key):
         # 잠금을 얻기 전에 다른 요청이 지웠거나 바꿨을 수 있어 잠금 안에서 다시 읽는다.
@@ -254,9 +281,11 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
         old_codec = cam.codec  # 저장이 실패해 되돌릴 때 다시 판별하지 않고 쓴다.
         # 보안: 비번이 *** 인 채로 주소(host 등)만 바꾸면 실비번이 다른 호스트로 샐 수 있다 —
         # 비번 외 컴포넌트가 바뀌었으면 400(평문 재입력 요구). 동일할 때만 복원 허용.
-        _guard_masked_credential_exfil(body.rtsp_url, old_url)
+        _guard_masked_credential_exfil(raw_url, old_url)
         # *** 마스킹된 비밀번호만 기존 실제값으로 복원, 나머지 수정(주소 등)은 보존.
-        new_url = _restore_masked_password(body.rtsp_url, old_url)
+        new_url = _restore_masked_password(raw_url, old_url)
+        # 되돌린 뒤의 길이로 검사한다 — *** 가 실제 비밀번호로 바뀌며 길어지고, 검사 도입 전 저장된 긴 주소도 여기서 걸린다.
+        _check_url_length(new_url)
         url_changed = new_url != old_url
         new_codec = old_codec
 
@@ -277,7 +306,7 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
                 )
 
         # DB 저장은 짧은 쓰기 락만 잡는다.
-        cam.name = body.name
+        cam.name = name
         cam.rtsp_url = new_url
         cam.codec = new_codec
         cam.version += 1  # 저장이 실패하면 롤백돼 그대로다.
