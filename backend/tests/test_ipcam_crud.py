@@ -19,19 +19,19 @@ def mtx():
     """ipcam.py 가 호출하는 mediamtx 함수를 mock — 실 httpx 호출 차단.
 
     create=register_stream(add), update=update_stream(PATCH), delete=remove_stream(끝상태 bool),
-    stats=ensure_stream(self-heal, 현재 path dict|None 반환). ensure 기본값 None(=path 없음),
+    stats=get_path(조회만, path dict|None 반환). get_path 기본값 None(=path 없음),
     remove 기본값 True(=제거 성공) — stats/delete 로직을 격리한다 (각 함수 자체 동작은
     test_mediamtx.py 단위테스트가 검증).
     """
     with patch("app.ipcam.register_stream") as register, \
          patch("app.ipcam.update_stream") as update, \
          patch("app.ipcam.remove_stream") as remove, \
-         patch("app.ipcam.ensure_stream") as ensure:
+         patch("app.ipcam.get_path") as get_path:
         register.return_value = True
         update.return_value = True
         remove.return_value = True
-        ensure.return_value = None
-        yield {"register": register, "update": update, "remove": remove, "ensure": ensure}
+        get_path.return_value = None
+        yield {"register": register, "update": update, "remove": remove, "get_path": get_path}
 
 
 @pytest.fixture()
@@ -209,8 +209,8 @@ def test_delete_503_when_mediamtx_api_unset(client, mtx):
 
 
 def test_delete_sweeps_path_after_commit_to_close_resurrection_race(client, mtx):
-    """commit 직후 sweep remove_stream 1회 더 — 삭제~commit 사이 stats 폴링 ensure_stream 이
-    path 를 재등록(resurrection)했어도 sweep 가 제거하고, row 가 없어 다시 부활 안 한다(TOCTOU).
+    """commit 직후 sweep remove_stream 1회 더 — 삭제~commit 사이 백그라운드 동기화가
+    path 를 재등록(resurrection)했어도 sweep 가 제거한다(1차 방어, TOCTOU).
 
     단일스레드 TestClient 라 실제 동시폴링은 못 내지만, sweep 호출(=race close 메커니즘)이
     실제로 발생하는지 — 초기 제거 + sweep = remove_stream 2회 — 를 고정한다.
@@ -240,8 +240,8 @@ def test_delete_succeeds_when_sweep_fails(client, mtx):
 
 def test_stats_active_with_readers(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
-    # ensure_stream(self-heal) 이 조회한 path 를 그대로 반환 — ready=true + readers 2개
-    mtx["ensure"].return_value = {"ready": True, "readers": [{}, {}]}
+    # mediamtx path 조회 결과 — ready=true + readers 2개
+    mtx["get_path"].return_value = {"ready": True, "readers": [{}, {}]}
     resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
     assert resp.status_code == 200
     assert resp.json() == {"active": True, "readers": 2}
@@ -250,7 +250,7 @@ def test_stats_active_with_readers(client, mtx):
 def test_stats_inactive_when_path_missing(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
     # path 없음 → None
-    mtx["ensure"].return_value = None
+    mtx["get_path"].return_value = None
     resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
     assert resp.status_code == 200
     assert resp.json() == {"active": False, "readers": 0}
@@ -259,22 +259,22 @@ def test_stats_inactive_when_path_missing(client, mtx):
 def test_stats_inactive_when_not_ready(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
     # path 존재하나 아직 ready 아님 (source 연결 전)
-    mtx["ensure"].return_value = {"ready": False, "readers": []}
+    mtx["get_path"].return_value = {"ready": False, "readers": []}
     resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
     assert resp.status_code == 200
     assert resp.json() == {"active": False, "readers": 0}
 
 
-def test_stats_invokes_ensure_stream_selfheal(client, mtx):
-    """stats 폴링이 ensure_stream(self-heal)을 호출 — mediamtx recreate 후 path 자가복구 접점.
-    프론트가 이 엔드포인트를 폴링하므로 backend 재시작 없이 path 가 복원된다."""
+def test_stats_only_reads_and_never_registers(client, mtx):
+    """stats 는 조회만 한다 — path 가 없어도 재등록하지 않는다(재등록은 백그라운드 동기화 몫)."""
     cam = client.post("/api/ipcams", json={"name": "s", "rtsp_url": "rtsp://x/s"}).json()
-    mtx["ensure"].reset_mock()
-    mtx["ensure"].return_value = {"ready": True, "readers": []}
+    mtx["register"].reset_mock()
+    mtx["get_path"].return_value = None
     resp = client.get(f"/api/ipcams/{cam['stream_key']}/stats")
     assert resp.status_code == 200
-    mtx["ensure"].assert_called_once()
-    assert mtx["ensure"].call_args.args[1] == cam["stream_key"]
+    assert resp.json() == {"active": False, "readers": 0}
+    mtx["get_path"].assert_called_once_with(cam["stream_key"])
+    mtx["register"].assert_not_called()
 
 
 # ─── net-new: 16대 cap (test-first) ───

@@ -8,6 +8,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.database import Base
 
 
+def stream_key_prefix() -> str:
+    """이 모듈이 만드는 stream_key 의 앞부분 — 동기화가 남은 path 를 가를 때도 쓴다."""
+    prefix = os.getenv("MEDIAMTX_PATH_PREFIX")
+    return f"{prefix}__ipcam-" if prefix else "ipcam-"
+
+
 def _generate_stream_key() -> str:
     """등록용 고유 스트림 키 생성.
 
@@ -15,9 +21,7 @@ def _generate_stream_key() -> str:
     (프로젝트간 path 충돌·교차열람 차단). 미설정(단독 mediamtx)이면 `ipcam-<hex>` (하위호환).
     mediamtx.py/transcode($MTX_PATH)/WHEP 는 stream_key 를 그대로 쓰므로 자동 네임스페이싱된다.
     """
-    suffix = f"ipcam-{uuid.uuid4().hex[:8]}"
-    prefix = os.getenv("MEDIAMTX_PATH_PREFIX")
-    return f"{prefix}__{suffix}" if prefix else suffix
+    return f"{stream_key_prefix()}{uuid.uuid4().hex[:8]}"
 
 
 class IpCam(Base):

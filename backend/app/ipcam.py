@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import MAX_IPCAMS
 from app.database import get_db
 from app.masking import _MASK, _restore_masked_password, _split_credentials, mask_rtsp_credentials
-from app.mediamtx import ensure_stream, register_stream, remove_stream, update_stream
+from app.mediamtx import get_path, register_stream, remove_stream, update_stream
 from app.mediamtx import _validate_rtsp_url
 from app.models import IpCam
 
@@ -219,10 +219,10 @@ def delete_ipcam(cam_id: int, db: Session = Depends(get_db)) -> None:
     된다(codex #4, security). 제거 성공(또는 이미 없음=멱등) 확인 후에만 commit.
 
     순서 = [mediamtx 제거 성공확인 → DB commit → sweep remove_stream]. commit 직후 sweep 으로
-    remove_stream 을 한 번 더 호출한다 — 첫 제거~commit 사이에 stats 폴링의 ensure_stream
-    (self-heal)이 path 를 재등록(resurrection)했을 수 있는데, 이 sweep 가 그 path 를 제거하고
-    row 가 이미 없으니 ensure_stream 이 다시 재부활시키지 않는다(TOCTOU race 차단). sweep 은
-    best-effort — commit 이 이미 끝났으므로 sweep 실패는 DB 일관성에 영향 없고 경고만 남긴다.
+    remove_stream 을 한 번 더 호출한다 — 첫 제거~commit 사이에 백그라운드 동기화가 path 를
+    재등록(resurrection)했을 수 있어 1차로 지운다. 더 늦게 되살아난 path 는 동기화의 등록 직후
+    DB 재확인과 남은 path 정리가 지운다. sweep 은 best-effort — commit 이 이미 끝났으므로
+    sweep 실패는 DB 일관성에 영향 없고 경고만 남긴다.
     """
     cam = db.query(IpCam).filter(IpCam.id == cam_id).first()
     if not cam:
@@ -239,7 +239,7 @@ def delete_ipcam(cam_id: int, db: Session = Depends(get_db)) -> None:
     db.delete(cam)
     db.commit()
 
-    # row 가 사라진 뒤(=ensure_stream 이 더는 재등록 안 함) sweep 으로 race resurrection 제거.
+    # row 가 사라진 뒤 sweep 으로 동기화가 되살린 path 를 1차로 제거한다.
     if not _remove_or_fail(stream_key):
         logger.warning("삭제 sweep 실패 — orphan path 가능성: stream_key=%s", stream_key)
 
@@ -247,21 +247,16 @@ def delete_ipcam(cam_id: int, db: Session = Depends(get_db)) -> None:
 
 
 @router.get("/{stream_key}/stats")
-def get_ipcam_stats(stream_key: str, db: Session = Depends(get_db)) -> dict:
+def get_ipcam_stats(stream_key: str) -> dict:
     """IP CAM path 활성/시청자수 (mediamtx /v3/paths/get 기반).
 
     - active: mediamtx path 가 ready (source 연결됨)
     - readers: 현재 WHEP 시청자 수
     path 가 없거나 ready 아니면 `{active: false, readers: 0}`.
 
-    self-heal: mediamtx 가 독립 재시작돼 path 가 사라졌으면 여기서 ensure_stream 이 자가복구
-    재등록한다(register_stream idempotent). 프론트가 이 엔드포인트를 폴링하므로 mediamtx
-    재시작 후 backend 재시작 없이 ~폴링주기 내 path 가 복원된다.
-
-    ensure_stream 이 이미 조회한 path 를 그대로 반환받아 재사용한다 — 별도 get_path 재호출을
-    없애 폴당 mediamtx httpx 를 2N→N 으로 줄인다(N=등록 카메라 수).
+    조회만 한다 — 빠진 path 재등록은 백그라운드 동기화(mediamtx.run_sync_loop)가 맡는다.
     """
-    path = ensure_stream(db, stream_key)
+    path = get_path(stream_key)
     if not path or not path.get("ready"):
         return {"active": False, "readers": 0}
     return {"active": True, "readers": len(path.get("readers", []))}

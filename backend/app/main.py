@@ -8,16 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import CORS_ORIGINS, MAX_IPCAMS, logger
 from app.database import SessionLocal, init_db
 from app.ipcam import router as ipcam_router
-from app.mediamtx import sync_streams
-
-
-def _bg_sync() -> None:
-    """DB 카메라 재등록을 서버 시작과 분리해 백그라운드에서 수행한다."""
-    db = SessionLocal()
-    try:
-        sync_streams(db)
-    finally:
-        db.close()
+from app.mediamtx import run_sync_loop
 
 
 @asynccontextmanager
@@ -26,11 +17,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # alembic 이 스키마 정본이지만, 테스트/로컬 첫 실행 편의를 위해 init_db() 유지.
     init_db()
 
-    # DB 카메라 재등록은 probe 지연과 무관하게 서버가 즉시 요청을 받도록 분리한다.
-    threading.Thread(target=_bg_sync, daemon=True).start()
+    # mediamtx path 동기화는 요청 처리와 분리된 스레드에서 서버 수명 동안 반복한다.
+    # 첫 주기는 기동 직후 바로 돈다 — 빠진 path 만 등록하므로 백엔드만 재시작하면 등록 0건이다.
+    # 세션 팩토리를 넘겨 주기마다 새 세션을 연다.
+    stop_sync = threading.Event()
+    threading.Thread(target=run_sync_loop, args=(stop_sync, SessionLocal), daemon=True).start()
 
     logger.info("RTSP Streaming API 서버 시작")
     yield
+    # 대기 중인 루프를 바로 깨워 끝낸다.
+    # 등록 도중이면 기다리지 않는다 — 데몬 스레드라 프로세스와 함께 끝난다.
+    # 그때 못 한 등록은 다음 기동의 첫 주기가 채운다.
+    stop_sync.set()
     logger.info("서버 종료")
 
 
