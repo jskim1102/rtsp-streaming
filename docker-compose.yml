@@ -7,12 +7,13 @@
 #          setup이 .env.example로 .env를 생성한다.
 # 브라우저 접속: http://<서버IP>:${FRONTEND_PORT}  (frontend)
 
+name: rtsp-streaming
+
 services:
   # ─────────────────────────────── Backend ───────────────────────────────
   backend:
     build:
       context: ./backend
-    image: ghcr.io/jskim1102/rtsp-streaming-backend:latest
     container_name: rtsp-streaming-backend
     environment:
       CORS_ORIGINS: ${CORS_ORIGINS:-}

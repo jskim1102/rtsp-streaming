@@ -113,12 +113,9 @@ Step 'MediaMTX와 서버 준비'
 # --policy 는 Compose 2.22 부터 — 그 전 버전은 이 옵션을 몰라 실패하므로 그때는 그냥 받는다
 if ($LASTEXITCODE -ne 0) { & docker compose pull mediamtx }
 if ($LASTEXITCODE -ne 0) { Die 'MediaMTX 이미지를 받지 못했어요. 인터넷 연결을 확인하세요.' }
-& docker compose pull backend
-if ($LASTEXITCODE -ne 0) {
-  Warn '서버 이미지를 받을 수 없어 이 PC에서 만듭니다. 처음에는 시간이 걸릴 수 있어요.'
-  & docker compose build backend
-  if ($LASTEXITCODE -ne 0) { Die '서버 이미지를 만들지 못했어요.' }
-}
+Ok '서버 이미지를 이 PC에서 만듭니다. 처음에는 시간이 걸릴 수 있어요.'
+& docker compose build backend
+if ($LASTEXITCODE -ne 0) { Die '서버 이미지를 만들지 못했어요.' }
 
 Step '시청 화면 만들기'
 & docker compose build frontend
