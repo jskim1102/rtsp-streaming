@@ -98,14 +98,14 @@ def test_list_returns_created_cams_in_id_order(client):
 
 def test_update_changes_name_and_url(client):
     cam = client.post("/api/ipcams", json={"name": "old", "rtsp_url": "rtsp://x/old"}).json()
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "new", "rtsp_url": "rtsp://x/new"})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "new", "rtsp_url": "rtsp://x/new", "version": 1})
     assert resp.status_code == 200
     assert resp.json()["name"] == "new"
     assert resp.json()["rtsp_url"] == "rtsp://x/new"
 
 
 def test_update_missing_returns_404(client):
-    resp = client.put("/api/ipcams/999", json={"name": "x", "rtsp_url": "rtsp://x/x"})
+    resp = client.put("/api/ipcams/999", json={"name": "x", "rtsp_url": "rtsp://x/x", "version": 1})
     assert resp.status_code == 404
 
 
@@ -133,7 +133,7 @@ def test_update_rtsp_change_updates_via_patch(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
     mtx["update"].reset_mock()
     mtx["remove"].reset_mock()
-    client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+    client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new", "version": 1})
     # 원자 PATCH 갱신 — teardown(remove) 선행 없음 (카메라 암전 0)
     mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://x/new", "h264")
     mtx["remove"].assert_not_called()
@@ -144,7 +144,7 @@ def test_update_no_rtsp_change_no_reregister(client, mtx):
     mtx["update"].reset_mock()
     mtx["remove"].reset_mock()
     # name 만 변경, rtsp 동일 → mediamtx 갱신 안 함
-    client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": "rtsp://x/same"})
+    client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": "rtsp://x/same", "version": 1})
     mtx["update"].assert_not_called()
     mtx["remove"].assert_not_called()
 
@@ -160,7 +160,7 @@ def test_update_patch_fails_falls_back_to_register(client, mtx):
     mtx["register"].reset_mock()
     mtx["update"].return_value = False  # PATCH 실패(path 부재)
     mtx["register"].return_value = True  # register 폴백 성공
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new", "version": 1})
     assert resp.status_code == 200
     mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://x/new", "h264")
     mtx["register"].assert_called_once_with(cam["stream_key"], "rtsp://x/new", "h264")
@@ -174,7 +174,7 @@ def test_update_503_when_patch_and_register_both_fail(client, mtx):
     mtx["register"].reset_mock()
     mtx["update"].return_value = False
     mtx["register"].return_value = False
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new", "version": 1})
     assert resp.status_code == 503
     assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://x/old"  # 롤백 → 기존 유지
 
@@ -255,7 +255,7 @@ def test_update_calls_mediamtx_without_db_lock(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
     mtx["update"].side_effect = lambda stream_key, rtsp_url, codec: _assert_db_writable(client.db_path) or True
 
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new", "version": 1})
 
     assert resp.status_code == 200
     assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://x/new"
@@ -270,7 +270,7 @@ def test_update_reverts_mediamtx_when_save_fails(client, mtx):
     locked = OperationalError("COMMIT", {}, Exception("database is locked"))
 
     with patch.object(Session, "commit", side_effect=locked):
-        resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+        resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new", "version": 1})
 
     assert resp.status_code == 503
     # 되돌릴 때는 DB 에 남은 이전 코덱을 쓴다 — 판별은 새 주소에 한 번만 돈다.
@@ -291,7 +291,7 @@ def test_returns_409_while_same_camera_is_busy(client, mtx, method):
 
     with camera_lock(cam["stream_key"]):
         if method == "put":
-            resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "new", "rtsp_url": "rtsp://x/new"})
+            resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "new", "rtsp_url": "rtsp://x/new", "version": 1})
         else:
             resp = client.delete(f"/api/ipcams/{cam['id']}")
 
@@ -300,6 +300,52 @@ def test_returns_409_while_same_camera_is_busy(client, mtx, method):
     mtx["update"].assert_not_called()
     mtx["remove"].assert_not_called()
     assert client.get("/api/ipcams").json()[0]["name"] == "b"
+
+
+# ─── 낙관적 락 (같은 카메라 동시 수정) ───
+
+
+def test_responses_include_version_starting_at_1(client):
+    cam = client.post("/api/ipcams", json={"name": "v", "rtsp_url": "rtsp://x/v"}).json()
+
+    assert cam["version"] == 1
+    assert client.get("/api/ipcams").json()[0]["version"] == 1
+
+
+def test_update_increments_version_even_for_name_only_change(client):
+    cam = client.post("/api/ipcams", json={"name": "v", "rtsp_url": "rtsp://x/v"}).json()
+
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": "rtsp://x/v", "version": 1})
+
+    assert resp.json()["version"] == 2
+    assert client.get("/api/ipcams").json()[0]["version"] == 2
+
+
+def test_update_rejects_stale_version_without_touching_mediamtx(client, mtx):
+    """화면을 연 뒤 다른 사람이 먼저 저장했으면 409 — 앞사람의 수정을 모르고 덮어쓰지 않는다."""
+    cam = client.post("/api/ipcams", json={"name": "v", "rtsp_url": "rtsp://x/old"}).json()
+    client.put(f"/api/ipcams/{cam['id']}", json={"name": "first", "rtsp_url": "rtsp://x/first", "version": 1})
+    mtx["update"].reset_mock()
+    mtx["probe"].reset_mock()
+
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "second", "rtsp_url": "rtsp://x/second", "version": 1})
+
+    assert resp.status_code == 409
+    assert "먼저 수정" in resp.json()["detail"]
+    mtx["update"].assert_not_called()
+    mtx["probe"].assert_not_called()
+    saved = client.get("/api/ipcams").json()[0]
+    assert (saved["name"], saved["rtsp_url"], saved["version"]) == ("first", "rtsp://x/first", 2)
+
+
+def test_update_without_version_is_rejected(client, mtx):
+    """버전 없이 보내면(예전 화면 등) 422 — 낙관적 락을 우회하지 못한다."""
+    cam = client.post("/api/ipcams", json={"name": "v", "rtsp_url": "rtsp://x/v"}).json()
+
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": "rtsp://x/v"})
+
+    assert resp.status_code == 422
+    assert client.get("/api/ipcams").json()[0]["name"] == "v"
 
 
 # ─── 코덱 판별 결과 저장 (재등록 때 ffprobe 생략) ───
@@ -338,7 +384,7 @@ def test_update_probes_new_url_once_even_with_register_fallback(client, mtx):
     mtx["probe"].return_value = "hevc"
     mtx["update"].return_value = False
 
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new", "version": 1})
 
     assert resp.status_code == 200
     mtx["probe"].assert_called_once_with("rtsp://x/new")
@@ -351,7 +397,7 @@ def test_name_only_update_does_not_probe(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/same"}).json()
     mtx["probe"].reset_mock()
 
-    client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": "rtsp://x/same"})
+    client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": "rtsp://x/same", "version": 1})
 
     mtx["probe"].assert_not_called()
     assert _stored_codec(client, cam["stream_key"]) == "h264"
@@ -510,7 +556,7 @@ def test_create_rejects_non_rtsp_scheme_400(client):
 
 def test_update_rejects_non_rtsp_scheme_400(client):
     cam = client.post("/api/ipcams", json={"name": "ok", "rtsp_url": "rtsp://x/ok"}).json()
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "ok", "rtsp_url": "ftp://x/evil"})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "ok", "rtsp_url": "ftp://x/evil", "version": 1})
     assert resp.status_code == 400
     assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://x/ok"  # 기존 유지
 
@@ -561,7 +607,7 @@ def test_update_masked_url_preserves_credentials(client, mtx):
     mtx["remove"].reset_mock()
 
     # 이름만 변경, URL 은 마스킹된 값 그대로 → 자격증명 보존, mediamtx 재등록 없음
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": masked})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": masked, "version": 1})
     assert resp.status_code == 200
     assert resp.json()["name"] == "renamed"
     assert resp.json()["rtsp_url"] == masked  # 여전히 마스킹 (저장된 실값은 secret 그대로)
@@ -589,7 +635,7 @@ def test_update_masked_password_with_changed_host_rejected_400(client, mtx):
 
     # host 만 .5 → .9 로 변경, 비번은 *** 그대로 → 거부(평문 재입력 요구)
     changed = "rtsp://admin:***@10.0.0.9:554/s"
-    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "c", "rtsp_url": changed})
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "c", "rtsp_url": changed, "version": 1})
     assert resp.status_code == 400
     # mediamtx 무변경(재등록·제거 0), DB 도 기존 .5 유지(주소 안 바뀜 = 실비번 안 샘)
     mtx["register"].assert_not_called()
@@ -629,7 +675,7 @@ def test_update_masked_reserved_char_password_changed_host_rejected_400(client, 
 
     resp = client.put(
         f"/api/ipcams/{cam['id']}",
-        json={"name": "c", "rtsp_url": "rtsp://admin:***@10.0.0.7:554/cam"},
+        json={"name": "c", "rtsp_url": "rtsp://admin:***@10.0.0.7:554/cam", "version": 1},
     )
     assert resp.status_code == 400
     mtx["register"].assert_not_called()
@@ -650,7 +696,7 @@ def test_update_new_plaintext_password_with_host_change_allowed(client, mtx):
     # 새 비번 newpw + host .9 → 200, 새 host+새 비번 전체로 PATCH 갱신(remove 선행 없음)
     resp = client.put(
         f"/api/ipcams/{cam['id']}",
-        json={"name": "c", "rtsp_url": "rtsp://admin:newpw@10.0.0.9:554/s"},
+        json={"name": "c", "rtsp_url": "rtsp://admin:newpw@10.0.0.9:554/s", "version": 1},
     )
     assert resp.status_code == 200
     mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://admin:newpw@10.0.0.9:554/s", "h264")
@@ -710,7 +756,7 @@ def test_update_forbidden_char_400_masks_password_in_detail(client):
     ).json()
     resp = client.put(
         f"/api/ipcams/{cam['id']}",
-        json={"name": "ok", "rtsp_url": "rtsp://admin:ba|d@10.0.0.9:554/s"},
+        json={"name": "ok", "rtsp_url": "rtsp://admin:ba|d@10.0.0.9:554/s", "version": 1},
     )
     assert resp.status_code == 400
     detail = resp.json()["detail"]

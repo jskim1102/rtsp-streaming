@@ -123,6 +123,8 @@ class IpCamCreate(BaseModel):
 class IpCamUpdate(BaseModel):
     name: str
     rtsp_url: str
+    # 화면이 수정 창을 열 때 받은 버전 — 필수다. 없으면 422(낙관적 락 우회 차단).
+    version: int
 
 
 class IpCamResponse(BaseModel):
@@ -131,6 +133,7 @@ class IpCamResponse(BaseModel):
     rtsp_url: str
     stream_key: str
     created_at: datetime
+    version: int
 
     model_config = {"from_attributes": True}
 
@@ -227,7 +230,8 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
     재전송되는 credential-exfil 을 막기 위해, 주소 변경 시엔 실제 비밀번호를 다시 입력해야 한다
     (_guard_masked_credential_exfil). 비밀번호 자체를 바꿀 때도 *** 를 지우고 새 비밀번호를 입력한다.
 
-    순서 = [카메라 잠금 → (주소 변경 시) mediamtx 갱신(락 밖) → DB commit(짧은 쓰기 락)].
+    순서 = [카메라 잠금 → 버전 확인 → (주소 변경 시) mediamtx 갱신(락 밖) → DB commit(짧은 쓰기 락)].
+    - 버전 확인(낙관적 락): body.version 이 DB 와 다르면 409. 저장에 성공하면 버전이 1 오른다.
     - mediamtx 를 먼저 바꾸는 이유: ffprobe·요청 동안 쓰기 락을 잡지 않기 위해서다.
     - 저장이 실패하면 mediamtx 를 이전 주소로 되돌리고 503.
     """
@@ -237,6 +241,14 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
         cam = db.query(IpCam).filter(IpCam.id == cam_id).first()
         if not cam:
             raise HTTPException(status_code=404, detail="IP CAM을 찾을 수 없습니다")
+
+        # 낙관적 락: 화면을 연 뒤 다른 사람이 먼저 저장했으면 거부한다 — 앞사람의 수정을 모르고 덮어쓰지 않게.
+        # mediamtx 를 건드리기 전에 확인한다. 카메라 잠금 안이라 비교한 뒤 저장할 때까지 버전이 바뀌지 않는다.
+        if body.version != cam.version:
+            raise HTTPException(
+                status_code=409,
+                detail="다른 사람이 먼저 수정했습니다 — 바뀐 값을 확인하고 다시 저장하세요",
+            )
 
         old_url = cam.rtsp_url
         old_codec = cam.codec  # 저장이 실패해 되돌릴 때 다시 판별하지 않고 쓴다.
@@ -268,6 +280,7 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
         cam.name = body.name
         cam.rtsp_url = new_url
         cam.codec = new_codec
+        cam.version += 1  # 저장이 실패하면 롤백돼 그대로다.
         try:
             db.commit()
         except SQLAlchemyError:

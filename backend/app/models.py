@@ -36,3 +36,7 @@ class IpCam(Base):
     # None = 모름(판별 실패 또는 마이그레이션 전 카메라) → 재인코딩(libx264)하고, 동기화가 재등록할 때 다시 판별한다.
     # 주소를 바꿀 때만 다시 판별한다 — 카메라 설정에서 코덱만 바꾸면 카메라를 지웠다 다시 등록해야 한다.
     codec: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # 낙관적 락용 버전 — 새 카메라는 1, 수정 API 가 저장에 성공할 때마다 1 올린다 (이름만 바꿔도).
+    # 화면이 받은 버전과 다르면 다른 사람이 먼저 수정한 것이라 저장을 거부한다(409).
+    # 동기화의 재등록·코덱 저장은 사용자가 바꾼 내용이 아니라 올리지 않는다.
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")

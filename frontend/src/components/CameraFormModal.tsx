@@ -14,12 +14,20 @@ export default function CameraFormModal({ open, editCam, onClose, onSave }: Prop
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false); // POST/PUT 진행중 — 버튼 disable + '등록 중…' (#124)
 
+  // 창을 열 때만 오류·진행 상태를 비운다.
+  // editCam 변경 때 비우면, 수정 충돌로 최신 값을 다시 채울 때 충돌 안내 문구가 바로 지워진다.
+  useEffect(() => {
+    if (open) {
+      setError("");
+      setSubmitting(false);
+    }
+  }, [open]);
+
+  // 창을 열 때와 수정 충돌로 최신 카메라 값을 받았을 때 입력란을 그 값으로 채운다.
   useEffect(() => {
     if (open) {
       setName(editCam?.name ?? "");
       setRtspUrl(editCam?.rtsp_url ?? "");
-      setError("");
-      setSubmitting(false);
     }
   }, [open, editCam]);
 

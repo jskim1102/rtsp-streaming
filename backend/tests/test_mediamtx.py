@@ -465,6 +465,9 @@ def test_reconcile_probes_unknown_codec_and_saves_it(sessions, mtx_calls, _stub_
     _stub_probe_codec.assert_called_once_with("rtsp://cam/1")
     mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1", "h264")
     assert _stored_codec(sessions, "ipcam-a") == "h264"
+    # 사용자가 바꾼 내용이 아니라 버전은 올리지 않는다 — 화면을 연 사람이 이유 없이 충돌을 받지 않게.
+    with sessions() as s:
+        assert s.query(IpCam.version).filter(IpCam.stream_key == "ipcam-a").scalar() == 1
 
 
 def test_reconcile_keeps_codec_unknown_when_probe_fails(sessions, mtx_calls, _stub_probe_codec):
