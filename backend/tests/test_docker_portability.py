@@ -44,6 +44,20 @@ def test_mediamtx_advertises_loopback_when_webrtc_host_is_unset() -> None:
     assert "MTX_WEBRTCADDITIONALHOSTS: ${MEDIAMTX_WEBRTC_HOST:-127.0.0.1}" in _service("mediamtx")
 
 
+def test_every_service_caps_container_log_size() -> None:
+    """로그 상한이 없으면 접근 로그가 디스크를 채워 DB 쓰기와 같은 서버의 다른 서비스까지 멈춘다."""
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    anchor = re.search(r"^x-logging: &default-logging\n((?:  .*\n)+)", compose, re.M)
+    assert anchor, "docker-compose.yml 최상위에 x-logging 공통 로그 설정이 없다"
+    settings = anchor.group(1)
+    assert "driver: json-file" in settings
+    assert 'max-size: "20m"' in settings
+    assert 'max-file: "5"' in settings
+    for name in ("backend", "frontend", "mediamtx"):
+        assert "logging: *default-logging" in _service(name), f"{name} 서비스에 로그 상한이 없다"
+
+
 def test_git_forces_lf_for_shell_scripts() -> None:
     attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
 

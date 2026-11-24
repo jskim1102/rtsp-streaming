@@ -9,6 +9,14 @@
 
 name: rtsp-streaming
 
+# 컨테이너 로그 상한 — 서비스당 20MB × 5개, 넘치면 오래된 파일부터 지운다.
+# 상한이 없으면 로그가 디스크를 채워 DB 쓰기와 같은 서버의 다른 서비스까지 멈춘다.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   # ─────────────────────────────── Backend ───────────────────────────────
   backend:
@@ -43,6 +51,7 @@ services:
       - rtsp-streaming
     depends_on:
       - mediamtx
+    logging: *default-logging
     restart: unless-stopped
 
   # ─────────────────────────────── Frontend ──────────────────────────────
@@ -73,6 +82,7 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    logging: *default-logging
     restart: unless-stopped
 
   # ─────────────────────────────── MediaMTX ──────────────────────────────
@@ -104,6 +114,7 @@ services:
       - ./mediamtx.yml:/mediamtx.yml:ro
     networks:
       - rtsp-streaming
+    logging: *default-logging
     restart: unless-stopped
 
 networks:
