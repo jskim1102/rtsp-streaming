@@ -13,10 +13,17 @@ from sqlalchemy.orm import Session
 from app import stream_status
 from app.config import MAX_IPCAMS
 from app.database import get_db
-from app.masking import _MASK, _restore_masked_password, _split_credentials, mask_rtsp_credentials
-from app.mediamtx import camera_lock, list_path_status, register_stream, remove_stream, update_stream
-from app.mediamtx import _probe_codec, _validate_rtsp_url
-from app.models import IpCam, _generate_stream_key
+from app.masking import MASK, mask_rtsp_credentials, restore_masked_password, split_credentials
+from app.mediamtx import (
+    camera_lock,
+    list_path_status,
+    probe_codec,
+    register_stream,
+    remove_stream,
+    update_stream,
+    validate_rtsp_url,
+)
+from app.models import IpCam, generate_stream_key
 
 logger = logging.getLogger("rtsp-streaming.ipcam")
 
@@ -63,7 +70,7 @@ def _check_url_length(rtsp_url: str) -> None:
 def _check_rtsp_url(rtsp_url: str) -> None:
     """rtsp_url 검증 — 위험하면 400 (DB 쓰기 전에 막아 오염·500 방지)."""
     try:
-        _validate_rtsp_url(rtsp_url)
+        validate_rtsp_url(rtsp_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -116,11 +123,11 @@ def _guard_masked_credential_exfil(new_raw: str, old_url: str) -> None:
     비번이 *** 이면서 나머지가 old 와 다르면 거부 — 평문 비번 재제출을 요구한다.
     비번이 *** 가 아니거나(사용자가 새 비번 입력) old 에 자격증명이 없으면 가드 무관.
     """
-    new = _split_credentials(new_raw)
-    if new is None or new[2] != _MASK:
+    new = split_credentials(new_raw)
+    if new is None or new[2] != MASK:
         return  # 자격증명 없음 / 비번이 *** 아님 (사용자가 새 비번 전체 입력) — 복원 안 일어남
-    old = _split_credentials(old_url)
-    # old 에 복원할 실제 비번이 없으면 복원할 게 없음 — 가드 무관(_restore 가 그대로 통과).
+    old = split_credentials(old_url)
+    # old 에 복원할 실제 비번이 없으면 복원할 게 없음 — 가드 무관(restore_masked_password 가 그대로 통과).
     if old is None or old[2] is None:
         return
     # new[2](비번)만 빼고 prefix(scheme)·user·rest(host:port/path) 가 동일해야 복원 허용.
@@ -187,7 +194,7 @@ def create_ipcam(body: IpCamCreate, db: Session = Depends(get_db)) -> IpCam:
     _check_url_length(rtsp_url)
     _check_rtsp_url(rtsp_url)
     # 잠금을 커밋 전에 잡으려고 stream_key 를 미리 만든다. 새 키라 잠금이 겹치는 일은 없다.
-    stream_key = _generate_stream_key()
+    stream_key = generate_stream_key()
     with _camera_lock_or_409(stream_key):
         # F7 동시성: count+insert 를 SQLite 쓰기 락으로 직렬화한다. count 조회 *전에* BEGIN IMMEDIATE
         # 로 RESERVED 락을 먼저 획득 — 동시에 들어온 다른 생성 요청은 이 트랜잭션이 commit 될 때까지
@@ -209,7 +216,7 @@ def create_ipcam(body: IpCamCreate, db: Session = Depends(get_db)) -> IpCam:
         # 코덱은 여기서 한 번만 판별해 등록에 쓰고 저장한다 — 재등록 때는 저장값을 쓴다.
         registered = False
         try:
-            codec = _probe_codec(rtsp_url)
+            codec = probe_codec(rtsp_url)
             registered = _register_or_fail(stream_key, rtsp_url, codec)
         finally:
             if not registered:
@@ -283,7 +290,7 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
         # 비번 외 컴포넌트가 바뀌었으면 400(평문 재입력 요구). 동일할 때만 복원 허용.
         _guard_masked_credential_exfil(raw_url, old_url)
         # *** 마스킹된 비밀번호만 기존 실제값으로 복원, 나머지 수정(주소 등)은 보존.
-        new_url = _restore_masked_password(raw_url, old_url)
+        new_url = restore_masked_password(raw_url, old_url)
         # 되돌린 뒤의 길이로 검사한다 — *** 가 실제 비밀번호로 바뀌며 길어지고, 검사 도입 전 저장된 긴 주소도 여기서 걸린다.
         _check_url_length(new_url)
         url_changed = new_url != old_url
@@ -295,7 +302,7 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
         if url_changed:
             _check_rtsp_url(new_url)
             # 새 주소의 코덱을 한 번만 판별해 PATCH 와 등록 폴백에 같이 쓴다. 이름만 바꾸면 판별하지 않는다.
-            new_codec = _probe_codec(new_url)
+            new_codec = probe_codec(new_url)
             # PATCH(부분 갱신) 우선 시도. 실패(예: mediamtx 가 독립 재시작돼 path 가 사라진 뒤
             # 수정 → PATCH 404)면 register 로 재생성 폴백(원본 deepeye remove+add 동작 복원) —
             # 그래야 path 부재 상태에서도 수정이 카메라를 복구한다. 둘 다 실패면 DB 는 그대로 → 503.

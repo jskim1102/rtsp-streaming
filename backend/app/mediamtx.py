@@ -49,7 +49,7 @@ def camera_lock(stream_key: str) -> threading.Lock:
         return lock
 
 
-def _validate_rtsp_url(rtsp_url: str) -> None:
+def validate_rtsp_url(rtsp_url: str) -> None:
     """rtsp_url 트러스트 경계 검증 (injection 2중 방어의 1단 — spec v2-transcode-binding §영향).
 
     - 스킴은 `rtsp://` 또는 `rtsps://`(TLS) 만 허용.
@@ -75,7 +75,7 @@ def _validate_rtsp_url(rtsp_url: str) -> None:
         )
 
 
-def _probe_codec(rtsp_url: str) -> str | None:
+def probe_codec(rtsp_url: str) -> str | None:
     """카메라 첫 비디오 스트림의 코덱명 감지 (ffprobe) — h264=passthrough/else=libx264 결정용.
 
     `ffprobe -select_streams v:0 -show_entries stream=codec_name` 로 코덱(h264/hevc/mjpeg…)을
@@ -103,14 +103,14 @@ def _transcode_command(rtsp_url: str, codec: str | None) -> str:
     """runOnDemand transcode 커맨드 — h264 소스는 무손실 passthrough, 그 외는 libx264.
 
     셸 없이 ffmpeg 를 직접 exec 한다(mediamtx 가 공백분리 후 직접 실행). 호출부가 판별한
-    코덱(`_probe_codec` 결과, DB 에 저장된 값)으로 **정적 커맨드**를 만든다 — 셸 변수($C/$V) 분기를 쓰지
+    코덱(`probe_codec` 결과, DB 에 저장된 값)으로 **정적 커맨드**를 만든다 — 셸 변수($C/$V) 분기를 쓰지
     않으므로 mediamtx 의 $VAR 치환과 충돌하지 않는다(3개 모듈이 포기했던 함정 회피).
     판별은 등록·주소 수정 때 한 번만 하고 저장해 재사용한다 — 재등록 때마다 ffprobe(최대 4초)를 돌리지 않게.
       - h264: `-c:v copy` 무손실 패스스루(재인코딩 0 → 화질 보존·CPU 0). WebRTC 네이티브
         코덱이라 그대로 송출. IDR 간격은 카메라 GOP 를 따른다(copy 라 강제 불가).
       - 그 외(H.265/MJPEG…) 또는 코덱 모름(None): libx264 재인코딩(WebRTC 호환 보장) +
         `-force_key_frames` 2초 IDR 강제(저fps 카메라 WHEP join 지연 방지).
-    rtsp_url 은 `_validate_rtsp_url`(공백/제어문자/셸메타 거부)로 검증돼 안전하게 인자로 들어간다.
+    rtsp_url 은 `validate_rtsp_url`(공백/제어문자/셸메타 거부)로 검증돼 안전하게 인자로 들어간다.
     `$RTSP_PORT`/`$MTX_PATH` 는 mediamtx 변수 — 정상 치환된다.
     """
     if codec == "h264":
@@ -149,11 +149,11 @@ def register_stream(stream_key: str, rtsp_url: str, codec: str | None = None) ->
     """mediamtx 에 path 등록 — 조건부 transcode runOnDemand (패턴 C).
 
     `{source: rtsp}` 패스스루 대신 runOnDemand 로 등록해 H.264 외 코덱을 재인코딩한다.
-    rtsp_url 은 bash 에 들어가므로 검증 후 사용.
+    rtsp_url 은 runOnDemand 의 ffmpeg 인자로 들어가므로(셸 없이 실행) 검증 후 사용.
     codec 은 호출부가 판별·저장한 값이다 — 이 함수는 ffprobe 를 돌리지 않는다. None 이면 libx264.
     """
     _require_api()
-    _validate_rtsp_url(rtsp_url)
+    validate_rtsp_url(rtsp_url)
     try:
         resp = httpx.post(
             f"{MEDIAMTX_API}/v3/config/paths/add/{stream_key}",
@@ -187,7 +187,7 @@ def update_stream(stream_key: str, rtsp_url: str, codec: str | None = None) -> b
     codec 은 register_stream 과 같다 — 호출부가 판별한 값을 넘긴다.
     """
     _require_api()
-    _validate_rtsp_url(rtsp_url)
+    validate_rtsp_url(rtsp_url)
     try:
         resp = httpx.patch(
             f"{MEDIAMTX_API}/v3/config/paths/patch/{stream_key}",
@@ -353,7 +353,7 @@ class StreamReconciler:
             # 저장된 코덱을 쓴다 — 대량 재등록에서 카메라마다 ffprobe(최대 4초)를 돌리지 않는다.
             # 모르면(등록 때 카메라가 꺼져 있었거나 마이그레이션 전 카메라) 지금 판별하고, 성공하면 저장한다.
             if cam.codec is None:
-                cam.codec = _probe_codec(cam.rtsp_url)
+                cam.codec = probe_codec(cam.rtsp_url)
                 db.commit()
             # 판별이 실패해도(카메라 꺼짐 등) 재인코딩 명령으로 등록은 성공한다.
             logger.info("mediamtx path 누락 → 재등록: %s", stream_key)

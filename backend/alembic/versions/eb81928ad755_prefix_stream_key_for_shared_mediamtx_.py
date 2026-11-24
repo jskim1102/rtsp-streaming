@@ -8,7 +8,6 @@ Create Date: 2026-06-29 18:42:12.587245
 from typing import Sequence, Union
 
 from alembic import op
-import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
@@ -21,7 +20,7 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     """공유 mediamtx 이전(CEO #115) — 기존 stream_key 에 프로젝트 prefix 부착(path 네임스페이싱).
 
-    신규 키는 app/models.py _generate_stream_key 가 MEDIAMTX_PATH_PREFIX 로 붙이고, 이미 저장된
+    신규 키는 app/models.py generate_stream_key 가 MEDIAMTX_PATH_PREFIX 로 붙이고, 이미 저장된
     행은 이 마이그레이션이 부착한다. WHERE NOT LIKE 로 idempotent(재실행·이미 붙은 행 무해).
     """
     op.execute(

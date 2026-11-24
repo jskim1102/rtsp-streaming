@@ -15,18 +15,18 @@ from sqlalchemy.orm import sessionmaker
 
 import app.mediamtx as mediamtx
 from app.database import Base
-from app.models import IpCam, _generate_stream_key, stream_key_prefix
+from app.models import IpCam, generate_stream_key, stream_key_prefix
 from app.stream_status import PathStatus, StreamStatusHub
 
-# autouse 패치 전 원본 _probe_codec — 실제 함수 단위테스트에서 mock subprocess 로 직접 호출.
-_REAL_PROBE = mediamtx._probe_codec
+# autouse 패치 전 원본 probe_codec — 실제 함수 단위테스트에서 mock subprocess 로 직접 호출.
+_REAL_PROBE = mediamtx.probe_codec
 
 
 @pytest.fixture(autouse=True)
 def _stub_probe_codec():
-    """_transcode_command 의 코덱 probe 가 실제 ffprobe(네트워크/바이너리)를 호출하지 않게 —
-    기본 None(→ libx264 폴백). h264 분기는 개별 테스트가 명시 override 한다."""
-    with patch("app.mediamtx._probe_codec", return_value=None) as p:
+    """코덱을 모르는 카메라를 재등록할 때 부르는 probe_codec 이 실제 ffprobe(네트워크/바이너리)를
+    호출하지 않게 — 기본 None(모름 → libx264 폴백). 판별 결과가 필요한 테스트는 return_value 를 바꾼다."""
+    with patch("app.mediamtx.probe_codec", return_value=None) as p:
         yield p
 
 
@@ -96,7 +96,7 @@ def test_register_posts_runondemand_payload():
         assert cmd.startswith("ffmpeg")
         # 카메라 rtsp 는 등록 시점 치환
         assert "rtsp://cam/stream1" in cmd
-        # 항상 H.264 transcode (모든 코덱 호환 — passthrough 최적화 포기)
+        # 코덱을 넘기지 않으면(모름) libx264 재인코딩 — h264 패스스루는 조건부 transcode 테스트가 본다
         assert "libx264" in cmd
         # 시간기반 keyframe 강제 — 저fps 카메라 WHEP join 지연 방지 (~2초 내 IDR)
         assert "force_key_frames" in cmd
@@ -285,7 +285,7 @@ def test_stream_key_prefix_matches_generated_keys(monkeypatch, prefix, expected)
         monkeypatch.setenv("MEDIAMTX_PATH_PREFIX", prefix)
 
     assert stream_key_prefix() == expected
-    assert _generate_stream_key().startswith(expected)
+    assert generate_stream_key().startswith(expected)
 
 
 def test_list_config_paths_returns_path_names():

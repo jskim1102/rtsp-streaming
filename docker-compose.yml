@@ -25,7 +25,7 @@ services:
     container_name: rtsp-streaming-backend
     environment:
       CORS_ORIGINS: ${CORS_ORIGINS:-}
-      # SQLite DB 를 named volume 으로 — config.py 기본 경로 대신 override (spec Decision).
+      # SQLite DB 를 named volume 으로 — database.py 기본 경로 대신 override (spec Decision).
       DATABASE_URL: sqlite:////app/data/ipcam.db
       # config.py 가 읽는 등록 cap. 비우면 config 기본 16.
       MAX_IPCAMS: ${MAX_IPCAMS:-16}
@@ -33,7 +33,7 @@ services:
       MEDIAMTX_API: ${MEDIAMTX_API:-http://mediamtx:9997}
       # path 네임스페이스 prefix — stream_key 가 `rtsp_streaming__ipcam-*` 로 생성(프로젝트간 교차열람 차단).
       MEDIAMTX_PATH_PREFIX: ${MEDIAMTX_PATH_PREFIX:-rtsp_streaming}
-      # mediamtx 인증 — backend user. API/publish/read.
+      # mediamtx 인증 — backend user. 경로 등록·조회 API 만 쓴다.
       MEDIAMTX_BACKEND_USER: ${MEDIAMTX_BACKEND_USER:-backend}
       MEDIAMTX_BACKEND_PASS: ${MEDIAMTX_BACKEND_PASS:?set MEDIAMTX_BACKEND_PASS in .env}
     ports:

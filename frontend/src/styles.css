@@ -125,8 +125,7 @@ label {
   font-weight: 500;
 }
 
-input,
-select {
+input {
   font: inherit;
   width: 100%;
   padding: 6px 8px;

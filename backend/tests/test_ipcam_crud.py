@@ -25,14 +25,14 @@ def mtx():
     """ipcam.py 가 호출하는 mediamtx 함수를 mock — 실 httpx 호출 차단.
 
     create=register_stream(add), update=update_stream(PATCH), delete=remove_stream(끝상태 bool),
-    probe=_probe_codec(ffprobe 코덱 판별, 기본 "h264").
+    probe=probe_codec(ffprobe 코덱 판별, 기본 "h264").
     remove 기본값 True(=제거 성공) — delete 로직을 격리한다 (각 함수 자체 동작은
     test_mediamtx.py 단위테스트가 검증).
     """
     with patch("app.ipcam.register_stream") as register, \
          patch("app.ipcam.update_stream") as update, \
          patch("app.ipcam.remove_stream") as remove, \
-         patch("app.ipcam._probe_codec") as probe:
+         patch("app.ipcam.probe_codec") as probe:
         register.return_value = True
         update.return_value = True
         remove.return_value = True
@@ -598,7 +598,7 @@ def test_concurrent_create_at_cap_never_exceeds_max():
 
     try:
         with patch.object(ipcam, "MAX_IPCAMS", 1), \
-             patch.object(ipcam, "_probe_codec", return_value=None), \
+             patch.object(ipcam, "probe_codec", return_value=None), \
              patch.object(ipcam, "register_stream", side_effect=slow_register):
             threads = [threading.Thread(target=worker, args=(i,)) for i in (0, 1)]
             for t in threads:
@@ -639,19 +639,19 @@ def test_create_accepts_rtsp_url_with_metachars(client):
     assert resp.status_code == 201
 
 
-# ─── net-new: P1-3 mediamtx 등록 실패 시 rollback (성공처럼 보이는 실패 방지) ───
+# ─── net-new: P1-3 mediamtx 등록 실패 시 저장한 행 삭제 (성공처럼 보이는 실패 방지) ───
 
 
-def test_create_rolls_back_when_mediamtx_register_fails(client, mtx):
-    """register_stream=False → 503 + DB 미저장(롤백)."""
+def test_create_removes_saved_row_when_mediamtx_register_fails(client, mtx):
+    """register_stream=False → 503 + 먼저 커밋한 행을 지운다(목록에 남지 않음)."""
     mtx["register"].return_value = False
     resp = client.post("/api/ipcams", json={"name": "x", "rtsp_url": "rtsp://x/1"})
     assert resp.status_code == 503
-    assert client.get("/api/ipcams").json() == []  # 롤백되어 흔적 없음
+    assert client.get("/api/ipcams").json() == []  # 행을 지워 흔적 없음
 
 
 def test_create_503_when_mediamtx_api_unset(client, mtx):
-    """MEDIAMTX_API 미설정(register_stream 이 RuntimeError) → 503 + 롤백."""
+    """MEDIAMTX_API 미설정(register_stream 이 RuntimeError) → 503 + 저장한 행 삭제."""
     mtx["register"].side_effect = RuntimeError("MEDIAMTX_API 미설정")
     resp = client.post("/api/ipcams", json={"name": "x", "rtsp_url": "rtsp://x/1"})
     assert resp.status_code == 503
@@ -781,7 +781,7 @@ def test_mask_restore_roundtrip_special_char_passwords():
 
     수용기준 문자셋: @ : % 공백 ! / # (공백은 API _validate 가 막지만 헬퍼는 견고해야 함).
     """
-    from app.ipcam import _restore_masked_password, mask_rtsp_credentials
+    from app.ipcam import restore_masked_password, mask_rtsp_credentials
 
     for pw in ["p@ss", "pa:ss", "p%2Fss", "pa ss", "p!ss", "pa/ss", "pa#ss", "a/b#c?d@e"]:
         original = f"rtsp://admin:{pw}@10.0.0.5:554/cam"
@@ -789,7 +789,7 @@ def test_mask_restore_roundtrip_special_char_passwords():
         assert masked == "rtsp://admin:***@10.0.0.5:554/cam", f"{pw!r} 마스킹 불완전: {masked!r}"
         assert pw not in masked, f"{pw!r} 평문 누수: {masked!r}"
         # 마스킹된 값으로(주소 미변경) 저장 → 실제 비번 복원 = 원본
-        restored = _restore_masked_password(masked, original)
+        restored = restore_masked_password(masked, original)
         assert restored == original, f"{pw!r} 복원 실패: {restored!r}"
 
 

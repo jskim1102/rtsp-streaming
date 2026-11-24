@@ -14,7 +14,7 @@ def stream_key_prefix() -> str:
     return f"{prefix}__ipcam-" if prefix else "ipcam-"
 
 
-def _generate_stream_key() -> str:
+def generate_stream_key() -> str:
     """등록용 고유 스트림 키 생성.
 
     공유 mediamtx 사용 시 MEDIAMTX_PATH_PREFIX 로 path 네임스페이싱 → `<prefix>__ipcam-<hex>`
@@ -30,7 +30,7 @@ class IpCam(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     rtsp_url: Mapped[str] = mapped_column(String(500), nullable=False)
-    stream_key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, default=_generate_stream_key)
+    stream_key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, default=generate_stream_key)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     # ffprobe 로 판별한 첫 비디오 코덱(h264·hevc 등) — 재등록 때 다시 판별하지 않고 쓴다.
     # None = 모름(판별 실패 또는 마이그레이션 전 카메라) → 재인코딩(libx264)하고, 동기화가 재등록할 때 다시 판별한다.
