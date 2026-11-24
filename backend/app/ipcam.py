@@ -15,7 +15,7 @@ from app.config import MAX_IPCAMS
 from app.database import get_db
 from app.masking import _MASK, _restore_masked_password, _split_credentials, mask_rtsp_credentials
 from app.mediamtx import camera_lock, list_path_status, register_stream, remove_stream, update_stream
-from app.mediamtx import _validate_rtsp_url
+from app.mediamtx import _probe_codec, _validate_rtsp_url
 from app.models import IpCam, _generate_stream_key
 
 logger = logging.getLogger("rtsp-streaming.ipcam")
@@ -48,26 +48,26 @@ def _check_rtsp_url(rtsp_url: str) -> None:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-def _register_or_fail(stream_key: str, rtsp_url: str) -> bool:
+def _register_or_fail(stream_key: str, rtsp_url: str, codec: str | None) -> bool:
     """register_stream 호출 — mediamtx 미설정(RuntimeError)·실패(False) 모두 False 로 정규화.
 
-    호출부가 commit 전에 등록 성공을 확인하고, 실패 시 rollback 할 수 있게 한다(P1-3).
+    호출부가 등록 성공을 확인하고, 실패 시 저장한 행을 지우거나 DB 를 그대로 둘 수 있게 한다(P1-3).
     """
     try:
-        return register_stream(stream_key, rtsp_url)
+        return register_stream(stream_key, rtsp_url, codec)
     except RuntimeError:
         logger.exception("mediamtx 미설정으로 스트림 등록 불가: %s", stream_key)
         return False
 
 
-def _update_or_fail(stream_key: str, rtsp_url: str) -> bool:
+def _update_or_fail(stream_key: str, rtsp_url: str, codec: str | None) -> bool:
     """update_stream(PATCH) 호출 — 미설정(RuntimeError)·실패(False) 모두 False 로 정규화.
 
-    update 의 암전방지 롤백순서용: 호출부가 commit 전에 PATCH 성공을 확인하고, 실패 시
-    DB rollback 한다. PATCH 실패면 mediamtx 가 기존 path 를 보존하므로 카메라 암전이 없다.
+    update 의 암전방지 순서용: 호출부가 DB 저장 전에 PATCH 성공을 확인하고, 실패 시
+    DB 를 그대로 둔다. PATCH 실패면 mediamtx 가 기존 path 를 보존하므로 카메라 암전이 없다.
     """
     try:
-        return update_stream(stream_key, rtsp_url)
+        return update_stream(stream_key, rtsp_url, codec)
     except RuntimeError:
         logger.exception("mediamtx 미설정으로 스트림 갱신 불가: %s", stream_key)
         return False
@@ -176,18 +176,33 @@ def create_ipcam(body: IpCamCreate, db: Session = Depends(get_db)) -> IpCam:
             )
         cam = IpCam(name=body.name, rtsp_url=body.rtsp_url, stream_key=stream_key)
         db.add(cam)
-        # 여기서 쓰기 락이 풀린다 — 아래 mediamtx 등록은 락 없이 한다.
+        # 여기서 쓰기 락이 풀린다 — 아래 판별·mediamtx 등록은 락 없이 한다.
         db.commit()
 
-        if not _register_or_fail(stream_key, body.rtsp_url):
-            # 이미 커밋했으므로 롤백 대신 행을 지운다.
-            # 이 삭제마저 실패하면 행이 남고, 동기화가 잠금이 풀린 뒤 재등록한다.
-            db.delete(cam)
-            db.commit()
+        # 코덱은 여기서 한 번만 판별해 등록에 쓰고 저장한다 — 재등록 때는 저장값을 쓴다.
+        registered = False
+        try:
+            codec = _probe_codec(body.rtsp_url)
+            registered = _register_or_fail(stream_key, body.rtsp_url, codec)
+        finally:
+            if not registered:
+                # 이미 커밋했으므로 롤백 대신 행을 지운다 — 등록 실패(False)든 예외든 행을 남기지 않는다.
+                # 이 삭제마저 실패하면 행이 남고, 동기화가 잠금이 풀린 뒤 재등록한다.
+                db.delete(cam)
+                db.commit()
+        if not registered:
             raise HTTPException(
                 status_code=503,
                 detail="mediamtx 스트림 등록에 실패했습니다 — 카메라가 저장되지 않았습니다",
             )
+
+        # 코덱 저장이 실패해도 카메라는 이미 등록됐다 — 모름(None)으로 두면 재등록 때 다시 판별한다.
+        cam.codec = codec
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.exception("코덱 저장 실패 — 재등록 때 다시 판별한다: %s", stream_key)
 
     db.refresh(cam)
     logger.info("IP CAM 등록: id=%d name=%s stream_key=%s", cam.id, cam.name, cam.stream_key)
@@ -224,22 +239,26 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
             raise HTTPException(status_code=404, detail="IP CAM을 찾을 수 없습니다")
 
         old_url = cam.rtsp_url
+        old_codec = cam.codec  # 저장이 실패해 되돌릴 때 다시 판별하지 않고 쓴다.
         # 보안: 비번이 *** 인 채로 주소(host 등)만 바꾸면 실비번이 다른 호스트로 샐 수 있다 —
         # 비번 외 컴포넌트가 바뀌었으면 400(평문 재입력 요구). 동일할 때만 복원 허용.
         _guard_masked_credential_exfil(body.rtsp_url, old_url)
         # *** 마스킹된 비밀번호만 기존 실제값으로 복원, 나머지 수정(주소 등)은 보존.
         new_url = _restore_masked_password(body.rtsp_url, old_url)
         url_changed = new_url != old_url
+        new_codec = old_codec
 
         # RTSP 주소 변경 시에만 mediamtx 갱신. DB 를 건드리기 전, 쓰기 락 없이 먼저 한다.
         # update_stream(PATCH)이 새 url 을 기존 path 에 **원자적 부분 갱신**한다 — teardown-before-register
         # (remove 선행) 없음. 실패 시 mediamtx 가 기존 config 를 그대로 보존하므로 old path 가 살아있다(카메라 암전 0).
         if url_changed:
             _check_rtsp_url(new_url)
+            # 새 주소의 코덱을 한 번만 판별해 PATCH 와 등록 폴백에 같이 쓴다. 이름만 바꾸면 판별하지 않는다.
+            new_codec = _probe_codec(new_url)
             # PATCH(부분 갱신) 우선 시도. 실패(예: mediamtx 가 독립 재시작돼 path 가 사라진 뒤
             # 수정 → PATCH 404)면 register 로 재생성 폴백(원본 deepeye remove+add 동작 복원) —
             # 그래야 path 부재 상태에서도 수정이 카메라를 복구한다. 둘 다 실패면 DB 는 그대로 → 503.
-            if not _update_or_fail(stream_key, new_url) and not _register_or_fail(stream_key, new_url):
+            if not _update_or_fail(stream_key, new_url, new_codec) and not _register_or_fail(stream_key, new_url, new_codec):
                 raise HTTPException(
                     status_code=503,
                     detail="mediamtx 재등록에 실패했습니다 — 변경이 저장되지 않았습니다(기존 스트림 유지)",
@@ -248,6 +267,7 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
         # DB 저장은 짧은 쓰기 락만 잡는다.
         cam.name = body.name
         cam.rtsp_url = new_url
+        cam.codec = new_codec
         try:
             db.commit()
         except SQLAlchemyError:
@@ -255,7 +275,7 @@ def update_ipcam(cam_id: int, body: IpCamUpdate, db: Session = Depends(get_db)) 
             # 되돌리기도 실패하면 로그만 남긴다 — 영상은 새 주소, 화면(DB)은 이전 주소인 상태가 된다.
             db.rollback()
             logger.exception("IP CAM 수정 저장 실패: id=%d", cam_id)
-            if url_changed and not _update_or_fail(stream_key, old_url):
+            if url_changed and not _update_or_fail(stream_key, old_url, old_codec):
                 logger.error("mediamtx 되돌리기 실패 — 새 주소로 재생 중, DB 는 이전 주소: %s", stream_key)
             raise HTTPException(
                 status_code=503,

@@ -24,17 +24,20 @@ from app.mediamtx import camera_lock
 def mtx():
     """ipcam.py 가 호출하는 mediamtx 함수를 mock — 실 httpx 호출 차단.
 
-    create=register_stream(add), update=update_stream(PATCH), delete=remove_stream(끝상태 bool).
+    create=register_stream(add), update=update_stream(PATCH), delete=remove_stream(끝상태 bool),
+    probe=_probe_codec(ffprobe 코덱 판별, 기본 "h264").
     remove 기본값 True(=제거 성공) — delete 로직을 격리한다 (각 함수 자체 동작은
     test_mediamtx.py 단위테스트가 검증).
     """
     with patch("app.ipcam.register_stream") as register, \
          patch("app.ipcam.update_stream") as update, \
-         patch("app.ipcam.remove_stream") as remove:
+         patch("app.ipcam.remove_stream") as remove, \
+         patch("app.ipcam._probe_codec") as probe:
         register.return_value = True
         update.return_value = True
         remove.return_value = True
-        yield {"register": register, "update": update, "remove": remove}
+        probe.return_value = "h264"
+        yield {"register": register, "update": update, "remove": remove, "probe": probe}
 
 
 @pytest.fixture()
@@ -123,7 +126,7 @@ def test_delete_missing_returns_404(client):
 
 def test_create_registers_mediamtx_path(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "c", "rtsp_url": "rtsp://x/c"}).json()
-    mtx["register"].assert_called_once_with(cam["stream_key"], "rtsp://x/c")
+    mtx["register"].assert_called_once_with(cam["stream_key"], "rtsp://x/c", "h264")
 
 
 def test_update_rtsp_change_updates_via_patch(client, mtx):
@@ -132,7 +135,7 @@ def test_update_rtsp_change_updates_via_patch(client, mtx):
     mtx["remove"].reset_mock()
     client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
     # 원자 PATCH 갱신 — teardown(remove) 선행 없음 (카메라 암전 0)
-    mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://x/new")
+    mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://x/new", "h264")
     mtx["remove"].assert_not_called()
 
 
@@ -159,8 +162,8 @@ def test_update_patch_fails_falls_back_to_register(client, mtx):
     mtx["register"].return_value = True  # register 폴백 성공
     resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
     assert resp.status_code == 200
-    mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://x/new")
-    mtx["register"].assert_called_once_with(cam["stream_key"], "rtsp://x/new")
+    mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://x/new", "h264")
+    mtx["register"].assert_called_once_with(cam["stream_key"], "rtsp://x/new", "h264")
     assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://x/new"
 
 
@@ -222,7 +225,7 @@ def _assert_db_writable(db_path: str) -> None:
 def test_create_commits_before_mediamtx_registration_without_db_lock(client, mtx):
     committed = []
 
-    def register(stream_key, rtsp_url):
+    def register(stream_key, rtsp_url, codec):
         _assert_db_writable(client.db_path)
         with closing(sqlite3.connect(client.db_path)) as con:
             committed.append(con.execute(
@@ -239,7 +242,7 @@ def test_create_commits_before_mediamtx_registration_without_db_lock(client, mtx
 def test_create_holds_camera_lock_while_registering(client, mtx):
     """등록하는 동안 그 카메라는 잠겨 있다 — 동기화가 같은 경로를 먼저 등록하지 않는다."""
     locked = []
-    mtx["register"].side_effect = lambda stream_key, rtsp_url: locked.append(camera_lock(stream_key).locked()) or True
+    mtx["register"].side_effect = lambda stream_key, rtsp_url, codec: locked.append(camera_lock(stream_key).locked()) or True
 
     resp = client.post("/api/ipcams", json={"name": "c", "rtsp_url": "rtsp://x/c"})
 
@@ -250,7 +253,7 @@ def test_create_holds_camera_lock_while_registering(client, mtx):
 
 def test_update_calls_mediamtx_without_db_lock(client, mtx):
     cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
-    mtx["update"].side_effect = lambda stream_key, rtsp_url: _assert_db_writable(client.db_path) or True
+    mtx["update"].side_effect = lambda stream_key, rtsp_url, codec: _assert_db_writable(client.db_path) or True
 
     resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
 
@@ -260,17 +263,22 @@ def test_update_calls_mediamtx_without_db_lock(client, mtx):
 
 def test_update_reverts_mediamtx_when_save_fails(client, mtx):
     """MediaMTX 는 바꿨는데 DB 저장이 실패하면 MediaMTX 를 이전 주소로 되돌린다."""
+    mtx["probe"].return_value = "hevc"
     cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
+    mtx["probe"].reset_mock()
+    mtx["probe"].return_value = "h264"
     locked = OperationalError("COMMIT", {}, Exception("database is locked"))
 
     with patch.object(Session, "commit", side_effect=locked):
         resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
 
     assert resp.status_code == 503
+    # 되돌릴 때는 DB 에 남은 이전 코덱을 쓴다 — 판별은 새 주소에 한 번만 돈다.
     assert mtx["update"].call_args_list == [
-        call(cam["stream_key"], "rtsp://x/new"),
-        call(cam["stream_key"], "rtsp://x/old"),
+        call(cam["stream_key"], "rtsp://x/new", "h264"),
+        call(cam["stream_key"], "rtsp://x/old", "hevc"),
     ]
+    mtx["probe"].assert_called_once_with("rtsp://x/new")
     assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://x/old"
 
 
@@ -292,6 +300,61 @@ def test_returns_409_while_same_camera_is_busy(client, mtx, method):
     mtx["update"].assert_not_called()
     mtx["remove"].assert_not_called()
     assert client.get("/api/ipcams").json()[0]["name"] == "b"
+
+
+# ─── 코덱 판별 결과 저장 (재등록 때 ffprobe 생략) ───
+
+
+def _stored_codec(client, stream_key: str) -> str | None:
+    with closing(sqlite3.connect(client.db_path)) as con:
+        return con.execute("SELECT codec FROM ip_cams WHERE stream_key = ?", (stream_key,)).fetchone()[0]
+
+
+def test_create_probes_once_and_saves_codec(client, mtx):
+    mtx["probe"].return_value = "hevc"
+
+    cam = client.post("/api/ipcams", json={"name": "c", "rtsp_url": "rtsp://x/c"}).json()
+
+    mtx["probe"].assert_called_once_with("rtsp://x/c")
+    mtx["register"].assert_called_once_with(cam["stream_key"], "rtsp://x/c", "hevc")
+    assert _stored_codec(client, cam["stream_key"]) == "hevc"
+
+
+def test_create_removes_saved_row_when_registration_raises(client, mtx):
+    """커밋 뒤 등록 단계에서 예외가 나도 행이 남지 않는다 — "실패처럼 보이는 성공" 방지."""
+    mtx["probe"].side_effect = RuntimeError("판별 중 예상 못 한 오류")
+
+    with pytest.raises(RuntimeError):
+        client.post("/api/ipcams", json={"name": "c", "rtsp_url": "rtsp://x/c"})
+
+    assert client.get("/api/ipcams").json() == []
+    mtx["register"].assert_not_called()
+
+
+def test_update_probes_new_url_once_even_with_register_fallback(client, mtx):
+    """PATCH 가 실패해 등록으로 폴백해도 판별은 한 번 — 같은 결과를 두 요청에 쓴다."""
+    cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/old"}).json()
+    mtx["probe"].reset_mock()
+    mtx["probe"].return_value = "hevc"
+    mtx["update"].return_value = False
+
+    resp = client.put(f"/api/ipcams/{cam['id']}", json={"name": "u", "rtsp_url": "rtsp://x/new"})
+
+    assert resp.status_code == 200
+    mtx["probe"].assert_called_once_with("rtsp://x/new")
+    mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://x/new", "hevc")
+    mtx["register"].assert_called_with(cam["stream_key"], "rtsp://x/new", "hevc")
+    assert _stored_codec(client, cam["stream_key"]) == "hevc"
+
+
+def test_name_only_update_does_not_probe(client, mtx):
+    cam = client.post("/api/ipcams", json={"name": "u", "rtsp_url": "rtsp://x/same"}).json()
+    mtx["probe"].reset_mock()
+
+    client.put(f"/api/ipcams/{cam['id']}", json={"name": "renamed", "rtsp_url": "rtsp://x/same"})
+
+    mtx["probe"].assert_not_called()
+    assert _stored_codec(client, cam["stream_key"]) == "h264"
 
 
 # ─── SSE 상태 푸시 (카메라별 stats 폴링 대체) ───
@@ -400,7 +463,7 @@ def test_concurrent_create_at_cap_never_exceeds_max():
     barrier = threading.Barrier(2)
     results: dict[int, tuple] = {}
 
-    def slow_register(stream_key, rtsp_url):
+    def slow_register(stream_key, rtsp_url, codec):
         time.sleep(0.3)  # commit 전 창을 넓혀 race 를 결정적으로 재현
         return True
 
@@ -417,6 +480,7 @@ def test_concurrent_create_at_cap_never_exceeds_max():
 
     try:
         with patch.object(ipcam, "MAX_IPCAMS", 1), \
+             patch.object(ipcam, "_probe_codec", return_value=None), \
              patch.object(ipcam, "register_stream", side_effect=slow_register):
             threads = [threading.Thread(target=worker, args=(i,)) for i in (0, 1)]
             for t in threads:
@@ -589,7 +653,7 @@ def test_update_new_plaintext_password_with_host_change_allowed(client, mtx):
         json={"name": "c", "rtsp_url": "rtsp://admin:newpw@10.0.0.9:554/s"},
     )
     assert resp.status_code == 200
-    mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://admin:newpw@10.0.0.9:554/s")
+    mtx["update"].assert_called_once_with(cam["stream_key"], "rtsp://admin:newpw@10.0.0.9:554/s", "h264")
     mtx["remove"].assert_not_called()
     assert client.get("/api/ipcams").json()[0]["rtsp_url"] == "rtsp://admin:***@10.0.0.9:554/s"
 

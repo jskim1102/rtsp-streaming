@@ -252,10 +252,15 @@ def mtx_calls():
         yield {"register": register, "remove": remove}
 
 
-def _add_cam(sessions, stream_key: str, rtsp_url: str = "rtsp://cam/1") -> None:
+def _add_cam(sessions, stream_key: str, rtsp_url: str = "rtsp://cam/1", codec: str | None = None) -> None:
     with sessions() as s:
-        s.add(IpCam(name=stream_key, rtsp_url=rtsp_url, stream_key=stream_key))
+        s.add(IpCam(name=stream_key, rtsp_url=rtsp_url, stream_key=stream_key, codec=codec))
         s.commit()
+
+
+def _stored_codec(sessions, stream_key: str) -> str | None:
+    with sessions() as s:
+        return s.query(IpCam.codec).filter(IpCam.stream_key == stream_key).scalar()
 
 
 def _run_cycles(sessions, listings: list, hub=None, statuses=None) -> None:
@@ -308,7 +313,7 @@ def test_reconcile_registers_only_missing_paths(sessions, mtx_calls):
 
     _run_cycles(sessions, [{"all_others", "ipcam-a"}])
 
-    mtx_calls["register"].assert_called_once_with("ipcam-b", "rtsp://cam/b")
+    mtx_calls["register"].assert_called_once_with("ipcam-b", "rtsp://cam/b", None)
     mtx_calls["remove"].assert_not_called()
 
 
@@ -413,7 +418,7 @@ def test_reconcile_registers_with_latest_db_url(sessions, mtx_calls):
 
     _run_cycle_with_listing(sessions, listing_after_api_update)
 
-    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/new")
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/new", None)
 
 
 def test_reconcile_skips_camera_locked_by_api(sessions, mtx_calls):
@@ -425,20 +430,67 @@ def test_reconcile_skips_camera_locked_by_api(sessions, mtx_calls):
     mtx_calls["register"].assert_not_called()
 
     _run_cycles(sessions, [set()])
-    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1")
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1", None)
 
 
 def test_reconcile_holds_camera_lock_while_registering(sessions, mtx_calls):
     """재등록하는 동안 그 카메라는 잠겨 있다 — 그 사이 수정·삭제 API 는 409 를 받는다."""
     _add_cam(sessions, "ipcam-a")
     locked = []
-    mtx_calls["register"].side_effect = lambda stream_key, rtsp_url: locked.append(
+    mtx_calls["register"].side_effect = lambda stream_key, rtsp_url, codec: locked.append(
         mediamtx.camera_lock(stream_key).locked()) or True
 
     _run_cycles(sessions, [set()])
 
     assert locked == [True]
     assert not mediamtx.camera_lock("ipcam-a").locked()
+
+
+def test_reconcile_reuses_stored_codec_without_probing(sessions, mtx_calls, _stub_probe_codec):
+    _add_cam(sessions, "ipcam-a", codec="h264")
+
+    _run_cycles(sessions, [set()])
+
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1", "h264")
+    _stub_probe_codec.assert_not_called()
+
+
+def test_reconcile_probes_unknown_codec_and_saves_it(sessions, mtx_calls, _stub_probe_codec):
+    """등록 때 카메라가 꺼져 있었거나 마이그레이션 전 카메라면, 재등록 때 판별해 저장한다."""
+    _add_cam(sessions, "ipcam-a", codec=None)
+    _stub_probe_codec.return_value = "h264"
+
+    _run_cycles(sessions, [set()])
+
+    _stub_probe_codec.assert_called_once_with("rtsp://cam/1")
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1", "h264")
+    assert _stored_codec(sessions, "ipcam-a") == "h264"
+
+
+def test_reconcile_keeps_codec_unknown_when_probe_fails(sessions, mtx_calls, _stub_probe_codec):
+    _add_cam(sessions, "ipcam-a", codec=None)
+
+    _run_cycles(sessions, [set()])
+
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1", None)
+    assert _stored_codec(sessions, "ipcam-a") is None
+
+
+def test_reconcile_failure_of_one_camera_does_not_block_others(sessions, mtx_calls, _stub_probe_codec, caplog):
+    """한 대의 실패(판별·DB 오류 등)가 다른 카메라의 재등록과 남은 path 정리를 막지 않는다."""
+    _add_cam(sessions, "ipcam-a", "rtsp://cam/a", codec=None)
+    _add_cam(sessions, "ipcam-b", "rtsp://cam/b", codec="h264")
+
+    def probe(rtsp_url):
+        raise RuntimeError("판별 중 예상 못 한 오류")
+
+    _stub_probe_codec.side_effect = probe
+    with caplog.at_level(logging.ERROR, logger="rtsp-streaming"):
+        _run_cycles(sessions, [{"ipcam-zz"}, {"ipcam-zz"}])
+
+    assert mtx_calls["register"].call_args_list[-1].args == ("ipcam-b", "rtsp://cam/b", "h264")
+    mtx_calls["remove"].assert_called_once_with("ipcam-zz")
+    assert any("ipcam-a" in r.getMessage() for r in caplog.records)
 
 
 def test_camera_lock_is_one_per_stream_key():
@@ -525,7 +577,7 @@ def test_reconcile_skips_only_status_check_when_status_list_fails(sessions, mtx_
     _run_cycles(sessions, [set()], hub, [None])
 
     assert hub.snapshot() == {"ipcam-b": {"active": True, "readers": 0}}
-    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1")
+    mtx_calls["register"].assert_called_once_with("ipcam-a", "rtsp://cam/1", None)
 
 
 def test_reconcile_marks_all_inactive_only_when_connection_drops(sessions, mtx_calls):
@@ -568,8 +620,7 @@ def test_sync_loop_feeds_global_status_hub(sessions):
 
 def test_transcode_h264_source_uses_passthrough_copy():
     """h264 소스 → -c:v copy 무손실 패스스루(재인코딩 0, 화질 보존). WebRTC 네이티브."""
-    with patch("app.mediamtx._probe_codec", return_value="h264"):
-        cmd = mediamtx._transcode_command("rtsp://cam/h264")
+    cmd = mediamtx._transcode_command("rtsp://cam/h264", "h264")
     assert "-c:v copy" in cmd
     assert "libx264" not in cmd
     assert "force_key_frames" not in cmd  # copy 라 인코더 옵션 없음
@@ -578,18 +629,29 @@ def test_transcode_h264_source_uses_passthrough_copy():
 
 def test_transcode_non_h264_source_uses_libx264():
     """H.265 등 비-h264 → libx264 재인코딩(WebRTC 호환) + 2초 IDR 강제."""
-    with patch("app.mediamtx._probe_codec", return_value="hevc"):
-        cmd = mediamtx._transcode_command("rtsp://cam/h265")
+    cmd = mediamtx._transcode_command("rtsp://cam/h265", "hevc")
     assert "-c:v libx264" in cmd
     assert "force_key_frames" in cmd
     assert "-c:v copy" not in cmd
 
 
 def test_transcode_probe_failure_falls_back_to_libx264():
-    """probe 실패(None) → 안전기본 libx264(현행 유지 = 롤백 안전)."""
-    with patch("app.mediamtx._probe_codec", return_value=None):
-        cmd = mediamtx._transcode_command("rtsp://cam/unknown")
+    """코덱 모름(None: 판별 실패·마이그레이션 전 카메라) → 안전기본 libx264(현행 유지 = 롤백 안전)."""
+    cmd = mediamtx._transcode_command("rtsp://cam/unknown", None)
     assert "-c:v libx264" in cmd
+
+
+def test_register_and_update_use_given_codec_without_probing(_stub_probe_codec):
+    """판별은 호출부가 한 번 하고 결과를 넘긴다 — 등록·갱신 함수는 ffprobe 를 돌리지 않는다."""
+    with patch.object(mediamtx, "MEDIAMTX_API", "http://mtx:9997"), \
+         patch("app.mediamtx.httpx.post", return_value=MagicMock(status_code=200)) as post, \
+         patch("app.mediamtx.httpx.patch", return_value=MagicMock(status_code=200)) as patch_:
+        mediamtx.register_stream("ipcam-x", "rtsp://cam/1", "h264")
+        mediamtx.update_stream("ipcam-x", "rtsp://cam/2", "h264")
+
+    assert "-c:v copy" in post.call_args.kwargs["json"]["runOnDemand"]
+    assert "-c:v copy" in patch_.call_args.kwargs["json"]["runOnDemand"]
+    _stub_probe_codec.assert_not_called()
 
 
 def test_probe_codec_parses_ffprobe_codec_name():
@@ -598,6 +660,13 @@ def test_probe_codec_parses_ffprobe_codec_name():
         run.return_value = MagicMock(stdout="H264\n")
         assert _REAL_PROBE("rtsp://cam/1") == "h264"
         assert run.call_args.kwargs.get("timeout") == 4  # CEO #124 — 도달불가 카메라 등록 latency 단축(10→4s)
+
+
+def test_probe_codec_returns_none_on_any_failure():
+    """어떤 실패든 None — 카메라가 UTF-8 이 아닌 오류 문구를 보내 디코드에 실패해도 예외가 새지 않는다."""
+    bad = UnicodeDecodeError("utf-8", b"\xb0\xa1", 0, 1, "invalid start byte")
+    with patch("app.mediamtx.subprocess.run", side_effect=bad):
+        assert _REAL_PROBE("rtsp://cam/1") is None
 
 
 def test_probe_codec_returns_none_on_failure():
@@ -632,5 +701,5 @@ def test_register_no_auth_when_pass_unset():
 
 def test_transcode_suppresses_ffmpeg_plaintext_url_log():
     """ffmpeg -hide_banner -loglevel error: stdout 의 rtsp 평문 URL 덤프 차단(#100.4)."""
-    cmd = mediamtx._transcode_command("rtsp://admin:pw@cam/1")
+    cmd = mediamtx._transcode_command("rtsp://admin:pw@cam/1", None)
     assert "-hide_banner" in cmd and "-loglevel error" in cmd
